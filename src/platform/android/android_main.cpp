@@ -541,6 +541,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             }
             else if (!strcmp(key, "bc_etc2")) cfg->bc_etc2 = v != 0;
             else if (!strcmp(key, "bc3_etc2")) cfg->bc3_etc2 = v != 0;
+            else if (!strcmp(key, "tex_cache_mb")) cfg->tex_cache_mb = std::clamp(v, 0, 4096);
             else if (!strcmp(key, "bc_astc")) cfg->bc_astc = v != 0;
             else if (!strcmp(key, "astc_block")) cfg->astc_block = v == 6 || v == 8 ? v : 4;
             else if (!strcmp(key, "aspect_ratio")) {
@@ -677,6 +678,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          int(cfg->bc_enabler), cfg->language.c_str(), cfg->render_scale, cfg->shadow_compare,
          int(cfg->game_hooks), int(cfg->skip_intro), int(cfg->render_pass_objects), int(cfg->mali_barriers), int(cfg->mali_tile_turbo), int(cfg->performance_mode), cfg->texture_mip_skip, int(cfg->lighter_post_fx), cfg->present_mode.c_str(),
          cfg->hole_test);
+    // The newer graphics settings (one line, so a report shows what was tried).
+    LOGI(kTag, "settings: sharp_hud %d, fsr %d, fxaa %d, shadow_quality %d, anisotropy %d, skip_hidden %d, skip_prepass %d, "
+         "bc_astc %d, astc_block %d, bc3_etc2 %d, tex_cache_mb %d, geo_cache_mb %d, performance_mode %d",
+         int(cfg->sharp_hud), int(cfg->fsr), cfg->fxaa, cfg->shadow_quality, cfg->anisotropy, cfg->skip_hidden,
+         int(cfg->skip_prepass), int(cfg->bc_astc), cfg->astc_block, int(cfg->bc3_etc2), cfg->tex_cache_mb, cfg->geo_cache_mb,
+         int(cfg->performance_mode));
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");

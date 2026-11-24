@@ -147,6 +147,7 @@ HLE_FUNC(_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE, void, nn_os_QueryMemoryI
 // 0.5 ms nap every 32 reads from then on, so it stops taking a fast core from the frame and render threads.
 // A thread that reads the clock at a normal rate never qualifies; a spin-wait may overshoot by up to 0.5 ms.
 HLE_FUNC(_ZN2nn2os13GetSystemTickEv, int64_t, nn_os_GetSystemTick, ()) {
+    dsr::hle::os::PollerClockRead();
     const int64_t t = NowTicks();
     thread_local int64_t last = 0, streak_start = 0;
     thread_local int dense = 0;

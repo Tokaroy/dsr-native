@@ -534,6 +534,9 @@ public final class SettingsMenu {
         toggle("bc_astc", Strings.t("astc_t"), Strings.t("astc_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         choice("astc_block", Strings.t("astcb_t"), Strings.t("astcb_n") + " " + Strings.t("changes_next"),
                 new String[] {"4", "6", "8"}, new String[] {Strings.t("astcb_4"), Strings.t("astcb_6"), Strings.t("astcb_8")}, "4");
+        choice("tex_cache_mb", Strings.t("texc_t"), Strings.t("texc_n") + " " + Strings.t("changes_next"),
+                new String[] {"512", "1024", "256", "0"},
+                new String[] {"512 MB", "1024 MB", "256 MB", Strings.t("off")}, "512");
         toggle("mali_barriers", Strings.t("malib_t"), Strings.t("malib_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         toggle("skip_prepass", Strings.t("prepass_t"), Strings.t("prepass_n") + " " + Strings.t("changes_next"), "1", "0", "0");

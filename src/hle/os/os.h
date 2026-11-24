@@ -11,6 +11,8 @@ namespace dsr::hle::os {
 constexpr int64_t kTickFrequency = 19'200'000;
 int64_t NowNs();                        // CLOCK_MONOTONIC
 int64_t NowTicks();
+// GetSystemTick on a network-polling thread (thread.cpp MarkPoller): naps it now and then.
+void PollerClockRead();
 int64_t TicksToNs(int64_t ticks);
 int64_t NsToTicks(int64_t ns);
 

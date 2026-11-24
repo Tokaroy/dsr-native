@@ -90,6 +90,10 @@ struct RuntimeConfig {
     // (4x smaller than RGBA8, but lossier: off by default).
     bool bc_etc2 = true;
     bool bc3_etc2 = false;
+    // tex_cache_mb (settings menu "Texture disk cache", from pull request #59): size limit (MB) of the on-disk
+    // cache of those conversions, ETC2 and ASTC (cache folder, tex_cache.dat/.idx): the next run reads converted
+    // textures back instead of encoding them again. 0 = off. Once full, new levels are not stored.
+    int tex_cache_mb = 512;
     // bc_astc (experimental; encoder from pull request #47 by fernanfez00): on GPUs with ASTC (Mali) BC1 / BC3 textures
     // are re-encoded as ASTC and BC5 normal maps as ASTC luminance + alpha, instead of ETC2 / decoded RGBA8.
     // astc_block: 4, 6 or 8 (world textures; the HUD, text and small textures stay 4x4).

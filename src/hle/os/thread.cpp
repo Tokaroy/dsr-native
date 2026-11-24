@@ -102,9 +102,14 @@ void RunTlsDestructors() {
 // third of a core all the time (Helio G80), for services that are never reached here. Its sleeps are stretched to
 // kPollerSleepNs and it runs at a low priority, so it stays off the cores and power the game needs.
 constexpr int64_t kPollerSleepNs = 5'000'000;
+// The online-services library names its threads "NexusRevolution Event", "... Socket", "... Surveillance" (an exact
+// "NexusRevolution" never matched, so this was never on). Logs from a Mali phone with two fast cores: the Socket
+// thread never sleeps (no SleepThread call: it loops over its timers reading the clock) and took 4-6 s of CPU per
+// 10 s; on a slower core its clock reads are too far apart for GetSystemTick's back-to-back rule to catch it.
 void MarkPoller(HostThread* ht) {
-    if (ht->name == "NexusRevolution") ht->poller.store(true, std::memory_order_relaxed);
+    if (ht->name.rfind("NexusRevolution", 0) == 0) ht->poller.store(true, std::memory_order_relaxed);
 }
+thread_local int64_t t_poller_run_start = 0;  // poller thread: when it last slept or napped (ticks)
 // On the poller thread itself, before it sleeps: lowers its priority once, returns the sleep to use.
 int64_t PollerSleep(int64_t ns) {
     thread_local bool lowered = false;
@@ -354,6 +359,26 @@ void RecordSleep(uintptr_t ret, uintptr_t frame, int64_t ns) {
 }  // namespace
 }  // namespace dsr::hle::os
 
+namespace dsr::hle::os {
+// From GetSystemTick: a poller thread (MarkPoller; the game is offline, so its network timing does not matter) that
+// has run 0.5 ms without sleeping naps 1.5 ms. That bounds it to about a quarter of a core, and the nap is short
+// in case it holds a lock the game also takes.
+void PollerClockRead() {
+    if (!t_current || !t_current->poller.load(std::memory_order_relaxed)) return;
+    const int64_t now = NowTicks();
+    if (!t_poller_run_start) t_poller_run_start = now;
+    if (now - t_poller_run_start < kTickFrequency / 2000) return;  // 0.5 ms
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        LOGI(kTag, "'%s' reads the clock without sleeping: it naps 1.5 ms after each 0.5 ms of running "
+             "(offline network polling)", t_current->name.c_str());
+    PollerSleep(0);  // lowers its priority once
+    timespec ts{0, 1'500'000};
+    nanosleep(&ts, nullptr);
+    t_poller_run_start = NowTicks();
+}
+}  // namespace dsr::hle::os
+
 HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t ns)) {
     dsr::hle::os::RecordSleep(reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
                 *static_cast<const uintptr_t*>(__builtin_frame_address(0)), ns);  // saved x29: the caller's frame
@@ -368,6 +393,7 @@ HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t
     timespec ts{time_t(ns / 1'000'000'000), long(ns % 1'000'000'000)};
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
     }
+    t_poller_run_start = 0;
 }
 HLE_ALIAS(nnosSleepThread, nn_os_SleepThread);
 
@@ -376,6 +402,7 @@ HLE_FUNC(_ZN2nn2os11YieldThreadEv, void, nn_os_YieldThread, ()) {
         const int64_t ns = PollerSleep(0);
         timespec ts{0, long(ns)};
         nanosleep(&ts, nullptr);
+        t_poller_run_start = 0;
         return;
     }
     sched_yield();

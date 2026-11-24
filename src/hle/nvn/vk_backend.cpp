@@ -58,6 +58,7 @@
 #include "hle/nvn/layout.h"
 #include "hle/os/os.h"
 #include "hle/nvn/shader/translator.h"
+#include "hle/nvn/tex_disk_cache.h"
 #include "hle/nvn/state.h"
 #include "hle/video.h"
 
@@ -1671,7 +1672,13 @@ private:
         if (const dsr::RuntimeConfig& rc = dsr::GetRuntime().config; rc.sharp_hud || rc.fxaa || rc.fsr) {
             const int rw = rc.render_width, rh = rc.render_height;
             const bool postfx = rc.fxaa || rc.fsr;
-            const int target_h = std::max(std::min(rc.screen_height > 0 ? rc.screen_height : 1080, 1080), postfx ? rh : 0);
+            // Performance mode caps the screen-sized image at 720 lines: at 1080 the enlarge, FSR/FXAA and the HUD
+            // draws cost a slow GPU about what a 0.75 render scale saves (a Mali G68 log: 1922x1080, ~28 ms frames).
+            const int cap_h = rc.performance_mode ? 720 : 1080;
+            const int target_h =
+                std::max(std::min(rc.screen_height > 0 ? rc.screen_height : 1080, cap_h), postfx ? rh : 0);
+            if (rc.performance_mode && target_h <= 720)
+                LOGI(kTag, "sharp_hud: performance_mode, the HUD and post-processing image is capped at 720 lines");
             if (rc.render_scale >= 0.999f && !postfx) {
                 LOGI(kTag, "sharp_hud: off at a 100%% render resolution (only used below it)");
             } else if (rw > 0 && rh > 0 && (target_h > rh || (postfx && target_h == rh))) {
@@ -2712,6 +2719,7 @@ private:
         size_t out_bytes;
         uint64_t key;  // ETC2 / ASTC cache key (0: not cached)
         int astc;      // ASTC block size (4, 6, 8) when `to` is ASTC
+        uint64_t tag = 0;  // second hash of the source blocks, for the texture disk cache (0: not stored on disk)
     };
     struct BcTask {
         uint32_t job;
@@ -2726,6 +2734,8 @@ private:
     static constexpr size_t kEtcCacheLimit = 96u << 20;
     double bc_convert_ms_ = 0;     // conversion time, for the stats line
     uint64_t bc_cache_hits_ = 0, bc_converted_levels_ = 0;
+    uint64_t bc_disk_hits_ = 0;  // levels read back from the texture disk cache (tex_disk_cache.h)
+    double bc_disk_ms_ = 0;      // time those reads took (they run on the render thread)
 
     // Converts rows [k.row0, k.row0 + k.rows) of one slice of job `j` (quick: the preview encode).
     static void ConvertTask(const BcJob& j, const BcTask& k, bool quick) {
@@ -2778,8 +2788,10 @@ private:
                     tasks->push_back({j, z, r, std::min(band, job.brows - r)});
         }
     }
-    void CacheEtc(uint64_t key, const uint8_t* data, size_t bytes) {
+    // Full encodes only (also written to the disk cache when `tag` is set): never the quick previews.
+    void CacheEtc(uint64_t key, const uint8_t* data, size_t bytes, uint64_t tag = 0) {
         if (!key) return;
+        if (tag) TexDiskCache::Get().Store(key, tag, data, bytes);  // copied, written on its own thread
         if (etc_cache_bytes_ + bytes > kEtcCacheLimit) {
             etc_cache_.clear();
             etc_cache_bytes_ = 0;
@@ -2800,7 +2812,7 @@ private:
         });
         for (const BcJob& j : bc_jobs_) {
             bc_converted_levels_++;
-            if (!quick) CacheEtc(j.key, j.out, j.out_bytes);
+            if (!quick) CacheEtc(j.key, j.out, j.out_bytes, j.tag);
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         bc_convert_ms_ += ms;
@@ -2929,7 +2941,7 @@ private:
             const VkDeviceSize off = StreamAlloc(c->out.size(), 16);
             memcpy(stream_ptr_ + off, c->out.data(), c->out.size());
             for (VkBufferImageCopy& r : c->regions) r.bufferOffset += off;
-            for (const BcJob& j : c->jobs) CacheEtc(j.key, j.out, j.out_bytes);
+            for (const BcJob& j : c->jobs) CacheEtc(j.key, j.out, j.out_bytes, j.tag);
             Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             Rec([regions = std::move(c->regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
                 vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
@@ -3018,6 +3030,21 @@ private:
                             memcpy(job.out, hit->second.data(), out_bytes);
                             bc_cache_hits_++;
                             cached = true;
+                        } else {
+                            // Not in memory: converted in an earlier run? (the cache is opened on first use)
+                            const dsr::RuntimeConfig& rc = dsr::GetRuntime().config;
+                            TexDiskCache& disk = TexDiskCache::Get();
+                            disk.Open(rc.cache_dir, uint64_t(std::max(0, rc.tex_cache_mb)) << 20);
+                            if (disk.Enabled()) {
+                                const auto d0 = std::chrono::steady_clock::now();
+                                job.tag = TexDiskCache::Tag(blocks, n);
+                                if (disk.Lookup(job.key, job.tag, job.out, out_bytes)) {
+                                    bc_disk_hits_++;
+                                    cached = true;
+                                }
+                                bc_disk_ms_ += std::chrono::duration<double, std::milli>(
+                                                   std::chrono::steady_clock::now() - d0).count();
+                            }
                         }
                     }
                     if (!cached) bc_jobs_.push_back(job);
@@ -6904,12 +6931,20 @@ private:
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
         LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
              pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
-        if (bc_converted_levels_ || bc_cache_hits_) {
-            LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the ETC2 cache (%.0f MB)",
+        if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
+            LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
                  (unsigned long long)bc_converted_levels_, bc_convert_ms_, (unsigned long long)bc_cache_hits_,
                  etc_cache_bytes_ / 1048576.0);
-            bc_converted_levels_ = bc_cache_hits_ = 0;
-            bc_convert_ms_ = 0;
+            if (TexDiskCache::Get().Enabled()) {
+                const TexDiskCache::Stats ds = TexDiskCache::Get().GetStats();
+                LOGI(kTag, "texture disk cache: %llu levels read back in %.0f ms; on disk %llu levels, %.0f MB "
+                           "(%llu stored, %llu dropped, %llu corrupt in total)",
+                     (unsigned long long)bc_disk_hits_, bc_disk_ms_, (unsigned long long)ds.entries,
+                     ds.data_bytes / 1048576.0, (unsigned long long)ds.stored, (unsigned long long)ds.dropped,
+                     (unsigned long long)ds.corrupt);
+            }
+            bc_converted_levels_ = bc_cache_hits_ = bc_disk_hits_ = 0;
+            bc_convert_ms_ = bc_disk_ms_ = 0;
         }
         {
             long rss_kb = 0;
