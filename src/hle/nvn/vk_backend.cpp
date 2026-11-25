@@ -1855,6 +1855,7 @@ private:
         const bool is_mali = props_.vendorID == 0x13B5 || strstr(props_.deviceName, "Mali") != nullptr;
         tile_turbo_ = dsr::GetRuntime().config.mali_tile_turbo && is_mali;
         late_depth_ = dsr::GetRuntime().config.late_depth;
+        no_bloom_ = dsr::GetRuntime().config.lighter_post_fx;
         if (late_depth_) LOGI(kTag, "settings late_depth = 1: depth read by shaders is copied at pass ends (no split)");
         if (tile_turbo_)
             LOGI(kTag, "settings mali_tile_turbo = 1: layout-scoped barriers (unknown layouts keep the full barrier)");
@@ -4950,6 +4951,31 @@ private:
         return snap;
     }
 
+    // Fragment programs of the bloom chain (identified in frame captures of 1.0.0 and 1.0.3; the same shaders on
+    // every device): bright pass, its blurs and the upsampling.
+    static bool IsBloomShader(uint64_t h) {
+        return h == 0xc3d56b6401ccb572ull || h == 0x512397bbc420f850ull || h == 0x9b44066e84ff04c6ull ||
+               h == 0x82aa25701a19c22bull;
+    }
+    bool no_bloom_ = false;
+    uint64_t bloom_skipped_ = 0;
+    // A colour target the game would have drawn into, cleared to transparent black instead (a pending clear done at
+    // the next pass boundary: no pass of its own).
+    void BlackOut(Image& img, int layer, int level) {
+        if (InOpenPass(&img)) EndRendering();
+        if (img.clear_pending) FlushClear(img);
+        img.clear_pending = true;
+        img.clear_value = VkClearValue{};
+        img.clear_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        img.clear_layer = layer;
+        img.clear_level = level;
+        img.clear_early = true;
+        img.written = true;
+        img.cpu_source = false;
+        clears_deferred_++;
+        EarlyClear(&img);
+    }
+
     // late_depth (settings, experimental): depth copies for shaders made at pass ends instead of splitting a pass.
     struct LateDepth {
         uint64_t depth, depth_serial, snap, snap_serial;
@@ -5136,6 +5162,18 @@ private:
                 shadow_draws_skipped_++;
                 return;
             }
+        }
+        // lighter_post_fx: no bloom. The bloom chain (frame captures: bright pass, blurs at 1/4 and 1/8 size and the
+        // upsampling, about ten one-draw passes, ~1.5 ms of GPU time a frame on a Mali-G68) is not drawn; its targets
+        // are cleared to black instead (at a pass boundary), so the final combine adds nothing. The game's own
+        // switch for it (debug menu "Bloom") is never read.
+        if (no_bloom_ && st_.program[1] && IsBloomShader(st_.program[1]->hash)) {
+            Begin();
+            for (int i = 0; i < st_.num_rt && size_t(i) < st_.rts.size(); i++)
+                if (Image* img = GetImage(st_.rts[size_t(i)], false); img && !IsDepthFormat(img->nvn_format))
+                    BlackOut(*img, st_.rts[size_t(i)].layer, st_.rts[size_t(i)].level);
+            if (bloom_skipped_++ == 0) LOGI(kTag, "lighter post-processing: bloom passes not drawn");
+            return;
         }
         Shader* vs = GetShader(*st_.program[0], vopt);
         // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.

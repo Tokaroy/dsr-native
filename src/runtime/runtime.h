@@ -133,7 +133,8 @@ struct RuntimeConfig {
     // it saved; the render thread copies.
     bool recorder_copies = false;
     // lighter_post_fx = 1: no ambient occlusion, depth of field, camera motion blur or light shafts (the engine's own
-    // switches; read at start-up). The menu turns it on with performance mode on GPUs without BC support.
+    // switches; read at start-up), and no bloom (its passes are skipped by vk_backend.cpp: the engine's bloom switch
+    // is never read). The menu turns it on with performance mode on GPUs without BC support.
     bool lighter_post_fx = false;
     // skip_intro = 1: the company logos at the start are skipped (straight to the title movie).
     bool skip_intro = false;
