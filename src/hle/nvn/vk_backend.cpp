@@ -1584,6 +1584,10 @@ public:
     }
 
 private:
+    struct PresentJob {
+        VkImage src = VK_NULL_HANDLE;  // the game's frame (in TRANSFER_SRC layout), or none: black
+        int sw = 0, sh = 0;
+    };
     // ---- presentation check: twice (presents 300 and 1200), the middle row of what went to the screen and of the
     // game's frame are read back and compared in the log (a black screen with a good frame: the copy to the screen).
     VkBuffer pcheck_buf_ = VK_NULL_HANDLE;
@@ -1633,10 +1637,9 @@ private:
     }
     void PresentCheckRead() {
         vkQueueWaitIdle(queue_);  // twice per run
-        const uint8_t* p = nullptr;
-        if (vkMapMemory(device_, pcheck_mem_, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(const_cast<uint8_t**>(&p))) !=
-            VK_SUCCESS)
-            return;
+        void* mapped = nullptr;
+        if (vkMapMemory(device_, pcheck_mem_, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) return;
+        const uint8_t* p = static_cast<const uint8_t*>(mapped);
         double m[2][3] = {};
         for (int k = 0; k < 2; k++)
             for (uint32_t i = 0; i < kCheckPixels; i++)
@@ -1647,10 +1650,6 @@ private:
              (unsigned long long)pcheck_presents_, m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2],
              frame_lit && screen_dark ? ": the copy to the screen image FAILED" : "");
     }
-    struct PresentJob {
-        VkImage src = VK_NULL_HANDLE;  // the game's frame (in TRANSFER_SRC layout), or none: black
-        int sw = 0, sh = 0;
-    };
     static void CmdImageBarrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
