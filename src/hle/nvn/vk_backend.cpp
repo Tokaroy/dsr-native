@@ -573,6 +573,9 @@ struct Image {
     // A clear not done yet: done as the load of the next render pass that starts on this subresource (no
     // separate full-image write and read on a tiling GPU), or for real before any other use.
     bool clear_pending = false;
+    // Its last pending clear was done separately (not as a pass load): the next one is done early, at a pass
+    // boundary, instead of ending whichever pass is open when the image is first used (see EarlyClear).
+    bool clear_early = false;
     // Was an attachment of a render pass with no barrier on it since: a later pass that uses it again in the same
     // layout needs a barrier first (see BeginRendering).
     bool attach_unsynced = false;
@@ -689,6 +692,7 @@ public:
                                 img->clear_layer = layer;
                                 img->clear_level = level;
                                 clears_deferred_++;
+                                EarlyClear(img);
                             }
                             img->written = true;
                             img->cpu_source = false;
@@ -933,11 +937,15 @@ public:
         geo_lo_ = UINTPTR_MAX;
         geo_hi_ = 0;
         StartPrehash();
+        ProfListStart();
+        prof_frame_start_ = false;
         ExecuteCommands(cmds, 0);
         if (capture_active_) CaptureEndOfPass();
         if (recording_) WriteBackSmallTargets();
         if (recording_) {
             EndRendering();
+            FlushEarlyClears();
+            ProfListEnd();
             SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
             recording_ = false;
         }
@@ -1147,6 +1155,136 @@ public:
         ts_pass_[ts_count_] = capture_pass_;
         ts_count_++;
     }
+    // ---- GPU time by pass: one frame every 10 s, in the regular log ---------------------------------------------
+    // Timestamps at each render pass start, around the presentation work (enlarge, FXAA / FSR, sharp HUD) and at
+    // the end of each list; read back a few frames later without waiting. An interval is labelled with the pass
+    // that starts it (its targets) and includes the copies, clears and barriers before the next pass. Gaps
+    // between submissions (GPU idle) are left out.
+    static constexpr uint32_t kProfMax = 160;
+    enum { kProfIdle, kProfRecording, kProfPending };
+    VkQueryPool prof_pool_ = VK_NULL_HANDLE;
+    int prof_state_ = kProfIdle;
+    bool prof_failed_ = false;
+    uint32_t prof_count_ = 0;
+    std::string prof_label_[kProfMax];  // label of the interval starting at timestamp i ("": not counted)
+    uint64_t prof_draws_[kProfMax] = {};
+    uint64_t prof_presented_ = 0;
+    bool prof_frame_start_ = false;  // no list since the last Present
+    std::chrono::steady_clock::time_point prof_next_{};
+    void ProfStamp(std::string label) {
+        if (prof_state_ != kProfRecording || prof_count_ >= kProfMax) return;
+        prof_label_[prof_count_] = std::move(label);
+        prof_draws_[prof_count_] = drawn_;
+        Rec([pool = prof_pool_, i = prof_count_](VkCommandBuffer cb) {
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, i);
+        });
+        prof_count_++;
+    }
+    // Start of a list (no pass open): starts a profile when one is due.
+    void ProfListStart() {
+        if (prof_state_ == kProfIdle) {
+            const auto now = std::chrono::steady_clock::now();
+            // Only from a frame's first list, so the whole frame is measured.
+            if (!prof_frame_start_ || prof_failed_ || capture_active_ || last_list_draws_ < 100 || now < prof_next_) return;
+            if (!prof_pool_) {
+                if (!props_.limits.timestampComputeAndGraphics) {
+                    prof_failed_ = true;
+                    return;
+                }
+                VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                qi.queryCount = kProfMax;
+                if (vkCreateQueryPool(device_, &qi, nullptr, &prof_pool_) != VK_SUCCESS) {
+                    prof_pool_ = VK_NULL_HANDLE;
+                    prof_failed_ = true;
+                    return;
+                }
+            }
+            Begin();
+            EndRendering();
+            Rec([pool = prof_pool_](VkCommandBuffer cb) { vkCmdResetQueryPool(cb, pool, 0, kProfMax); });
+            prof_count_ = 0;
+            prof_state_ = kProfRecording;
+        }
+        if (prof_state_ == kProfRecording) {
+            Begin();
+            ProfStamp("between passes");
+        }
+    }
+    void ProfListEnd() { ProfStamp(""); }  // after the list's last pass: the submission gap is not counted
+    void ProfMark(const std::vector<Image*>& colors, Image* depth, uint32_t w, uint32_t h) {
+        if (prof_state_ != kProfRecording) return;
+        char label[96];
+        const Image* c0 = nullptr;
+        size_t n = 0;
+        for (Image* c : colors)
+            if (c) {
+                if (!c0) c0 = c;
+                n++;
+            }
+        if (c0)
+            snprintf(label, sizeof(label), "%ux%u fmt %d%s%s", w, h, c0->nvn_format,
+                     n > 1 ? (" x" + std::to_string(n)).c_str() : "", depth ? " +depth" : "");
+        else if (depth)
+            snprintf(label, sizeof(label), "depth only %ux%u%s", w, h, w == h ? " (shadow map)" : "");
+        else
+            snprintf(label, sizeof(label), "no targets %ux%u", w, h);
+        ProfStamp(label);
+    }
+    // Present: the presentation work is its own interval; the profile ends with the frame.
+    void ProfPresentStart() {
+        ProfStamp("present: enlarge, FXAA / FSR, sharp HUD");  // after BeginCommands (Present's own buffer)
+    }
+    void ProfPresentEnd() {
+        if (prof_state_ != kProfRecording) return;
+        ProfStamp("");
+        prof_state_ = kProfPending;
+        prof_presented_ = presented_;
+    }
+    // A few frames later: reads the timestamps (no waiting) and logs the frame's GPU time by pass.
+    void ProfCollect() {
+        if (prof_state_ != kProfPending || presented_ < prof_presented_ + 3) return;
+        std::vector<uint64_t> ts(prof_count_);
+        const VkResult r = prof_count_ ? vkGetQueryPoolResults(device_, prof_pool_, 0, prof_count_, ts.size() * 8,
+                                                               ts.data(), 8, VK_QUERY_RESULT_64_BIT)
+                                       : VK_ERROR_UNKNOWN;
+        if (r == VK_NOT_READY && presented_ < prof_presented_ + 30) return;
+        prof_state_ = kProfIdle;
+        prof_next_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        if (r != VK_SUCCESS) return;
+        struct Agg {
+            double ms = 0;
+            uint32_t passes = 0;
+            uint64_t draws = 0;
+        };
+        std::map<std::string, Agg> by;
+        double total = 0;
+        uint32_t passes = 0;
+        for (uint32_t i = 0; i + 1 < prof_count_; i++) {
+            if (prof_label_[i].empty() || ts[i + 1] < ts[i]) continue;
+            const double ms = double(ts[i + 1] - ts[i]) * props_.limits.timestampPeriod / 1e6;
+            Agg& a = by[prof_label_[i]];
+            a.ms += ms;
+            a.passes++;
+            a.draws += prof_draws_[i + 1] - prof_draws_[i];
+            total += ms;
+            if (prof_label_[i] != "between passes") passes++;
+        }
+        std::vector<std::pair<double, std::string>> v;
+        for (auto& [label, a] : by) {
+            char d[200];
+            snprintf(d, sizeof(d), " %s: %.2f ms (%u%s, %llu draws);", label.c_str(), a.ms, a.passes,
+                     label == "between passes" ? " gaps" : a.passes == 1 ? " pass" : " passes",
+                     (unsigned long long)a.draws);
+            v.push_back({a.ms, d});
+        }
+        std::sort(v.rbegin(), v.rend());
+        std::string line;
+        for (size_t i = 0; i < v.size() && i < 14; i++) line += v[i].second;
+        LOGI(kTag, "GPU time by pass (one frame: %.1f ms, %u passes%s):%s", total, passes,
+             prof_count_ >= kProfMax ? ", cut short" : "", line.c_str());
+    }
+
     void CaptureEndOfPass() {
         WriteTimestamp();
         if (!pass_written_.empty())
@@ -1381,6 +1519,7 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         if (!EnsureDevice()) return;
         ReportDraws();
+        ProfCollect();
         occ_frame_++;
         if (occ_still_ < 1000000) occ_still_++;  // OccCamera sets it back to 0 when the camera moves
         // skip_hidden: keys of draws the game no longer issues (streamed geometry gets new addresses) go.
@@ -1412,6 +1551,7 @@ public:
         if (!EnsureSwapchain()) return;
         // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
+        ProfPresentStart();
         // sharp_hud: a frame whose HUD did not go into its sharp image (none drawn, or dropped) is enlarged into it
         // now (recorded here: the command buffer above is where this frame's presentation goes).
         if (sharp && !SharpActive(*game_frame)) SharpEnlarge(*game_frame, *sharp);
@@ -1428,6 +1568,8 @@ public:
             }
         }
         barriers_ += 2;
+        ProfPresentEnd();
+        prof_frame_start_ = true;
         Slot& sl = slots_[slot_];
         sl.ts_written = sl.ts != VK_NULL_HANDLE;
         sl.pending = true;
@@ -3909,6 +4051,8 @@ private:
     // Performs a deferred clear (outside a render pass).
     void FlushClear(Image& img) {
         img.clear_pending = false;
+        img.clear_early = true;
+        if (rendering_) clears_breaking_++;
         EndRendering();
         const VkImageLayout dst = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         if (img.layout != dst) {
@@ -3926,6 +4070,34 @@ private:
                 vkCmdClearDepthStencilImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v.depthStencil, 1, &range);
         });
         clears_flushed_++;
+    }
+    // Clears that will not become a pass load (clear_early): done now if no pass is open, else at the next pass
+    // boundary (FlushEarlyClears), so they do not end a pass later. Clearing earlier is the same: the game's clear
+    // command was already issued, and nothing used the image since.
+    std::vector<std::pair<uint64_t, uint64_t>> early_clears_;  // image address, serial
+    uint64_t clears_early_ = 0, clears_breaking_ = 0;
+    void EarlyClear(Image* img) {
+        if (!img->clear_early || capture_active_) return;
+        if (!rendering_) {
+            FlushClear(*img);
+            clears_early_++;
+        } else if (early_clears_.size() < 64) {
+            early_clears_.push_back({img->addr, img->serial});
+        }
+    }
+    // At a pass boundary (no pass open): the clears EarlyClear queued, except for the images the next pass draws
+    // into (`skip`: their clear becomes its load).
+    void FlushEarlyClears(const std::vector<Image*>* colors = nullptr, Image* depth = nullptr) {
+        if (early_clears_.empty() || rendering_) return;
+        for (auto [addr, serial] : early_clears_) {
+            auto it = images_.find(addr);
+            if (it == images_.end() || it->second.serial != serial || !it->second.clear_pending) continue;
+            Image& img = it->second;
+            if (&img == depth || (colors && std::find(colors->begin(), colors->end(), &img) != colors->end())) continue;
+            FlushClear(img);
+            clears_early_++;
+        }
+        early_clears_.clear();
     }
     uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, lrz_touches_ = 0,
              shader_depth_draws_ = 0;
@@ -3999,6 +4171,7 @@ private:
                 img->clear_layer = rr.layer;
                 img->clear_level = rr.level;
                 clears_deferred_++;
+                EarlyClear(img);
             }
             img->written = true;
             img->cpu_source = false;
@@ -4314,6 +4487,8 @@ private:
             });
             rendering_ = false;
             pass_breaks_[line]++;
+            ended_key_ = rendering_key_;
+            ended_line_ = line;
             if (mali_barriers_)
                 for (size_t i = 0; i < pass_color_count_; i++) {
                     Image* c = pass_colors_[i];
@@ -4409,7 +4584,13 @@ private:
         }
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
+        // A pass that starts again on the targets of the pass ended last, by something other than a change of
+        // targets: split (its tiles stored, then loaded again). Counted by what ended it.
+        if (!rendering_ && key == ended_key_ && ended_line_) resumed_passes_[ended_line_]++;
         EndRendering();
+        ended_line_ = 0;
+        FlushEarlyClears(&colors, depth);
+        ProfMark(colors, depth, w, h);
         if (depth && depth->depth_exported && dsr::GetRuntime().config.lrz_workaround) LrzTouch(*depth);
         // An image the previous pass rendered to, used again here in the same layout, gets no layout transition
         // and so had no barrier: without one the GPU may run the passes overlapped. On tiled GPUs (Adreno) a
@@ -4466,7 +4647,7 @@ private:
                 const bool clear_on_load = c->clear_pending && c->clear_layer == RtSub(ci).first &&
                                            c->clear_level == RtSub(ci).second && w == std::max(1u, uint32_t(c->width) >> lv) &&
                                            h == std::max(1u, uint32_t(c->height) >> lv);
-                if (clear_on_load) c->clear_pending = false;
+                if (clear_on_load) c->clear_pending = c->clear_early = false;
                 Transition(*c, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second,
                                              ci < st_.rts.size() ? st_.rts[ci].view_format : 0);
@@ -4506,7 +4687,7 @@ private:
                                        depth->clear_level == RtSub(8).second &&
                                        w == std::max(1u, uint32_t(depth->width) >> lv) &&
                                        h == std::max(1u, uint32_t(depth->height) >> lv);
-            if (clear_on_load) depth->clear_pending = false;
+            if (clear_on_load) depth->clear_pending = depth->clear_early = false;
             Transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             da.imageView = AttachmentView(*depth, RtSub(8).first, RtSub(8).second);
             bp.depth_format = depth->vk_format;
@@ -7067,6 +7248,21 @@ private:
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
              (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_, (unsigned long long)shader_depth_draws_);
         clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = shader_depth_draws_ = 0;
+        if (clears_early_ || clears_breaking_)
+            LOGI(kTag, "separate clears: %llu done early at a pass boundary, %llu still ended an open pass",
+                 (unsigned long long)clears_early_, (unsigned long long)clears_breaking_);
+        clears_early_ = clears_breaking_ = 0;
+        if (!resumed_passes_.empty()) {
+            std::vector<std::pair<uint64_t, int>> v;
+            for (auto& [line, n] : resumed_passes_) v.push_back({n, line});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 8; i++)
+                top += " line " + std::to_string(v[i].second) + ": " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "passes split and resumed on the same targets (stored and loaded again), by what ended them:%s",
+                 top.c_str());
+            resumed_passes_.clear();
+        }
         if (load_skip_ && loads_skipped_) {
             LOGI(kTag, "render target loads skipped (passes whose first draw overwrites them): %llu",
                  (unsigned long long)loads_skipped_);
@@ -7339,6 +7535,9 @@ private:
     }
     bool recording_ = false, rendering_ = false;
     std::vector<uint64_t> rendering_key_;
+    std::vector<uint64_t> ended_key_;  // the key of the pass ended last, and the source line that ended it
+    int ended_line_ = 0;
+    std::map<int, uint64_t> resumed_passes_;
 
     VkBuffer stream_ = VK_NULL_HANDLE;
     VkDeviceMemory stream_memory_ = VK_NULL_HANDLE;
