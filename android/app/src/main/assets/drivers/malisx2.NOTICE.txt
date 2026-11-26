@@ -1,4 +1,4 @@
-malisx2.zip: malisx2 0.6.0+62d6d62423, a Vulkan driver for Arm Mali GPUs on kbase (https://github.com/ARMSX2 / bmdhacks), built from
+malisx2.zip: malisx2 0.6.1+9fbc7da290, a Vulkan driver for Arm Mali GPUs on kbase (https://github.com/ARMSX2 / bmdhacks), built from
 its own sources; it gives Mali-G52 / G57 / G610 native BC textures. Used when settings gpu_driver = malisx2.
 
 MIT License
