@@ -1372,6 +1372,22 @@ final class Strings {
                 "화면 주사율 (실험적): 화면 주사율(%d Hz)만큼의 fps. 60fps를 넘으면 게임 물리가 이상해질 수 있습니다(사다리, 점프, 낙하, 일부 애니메이션).",
                 "屏幕刷新率 (实验性)：帧率与屏幕刷新率 (%d Hz) 相同。超过 60 FPS 时游戏物理可能出错（梯子、跳跃、坠落、部分动画）。",
                 "螢幕更新率 (實驗性)：幀率與螢幕更新率 (%d Hz) 相同。超過 60 FPS 時遊戲物理可能出錯（梯子、跳躍、墜落、部分動畫）。");
+        put("sec_exit", "Exit", "Quitter", "Beenden", "Esci", "Salir", "Sair", "Выход", "終了", "종료", "退出", "退出");
+        put("exit_t", "Exit game", "Quitter le jeu", "Spiel beenden", "Esci dal gioco", "Salir del juego", "Sair do jogo",
+                "Выйти из игры", "ゲームを終了", "게임 종료", "退出游戏", "結束遊戲");
+        put("exit_q",
+                "Close the game now? The game saves automatically; if the saving icon is showing, wait for it to disappear first.",
+                "Fermer le jeu maintenant ? Le jeu sauvegarde automatiquement ; si l'icône de sauvegarde est affichée, attendez qu'elle disparaisse.",
+                "Spiel jetzt schließen? Das Spiel speichert automatisch; wird das Speichersymbol angezeigt, warte, bis es verschwindet.",
+                "Chiudere il gioco ora? Il gioco salva automaticamente; se è visibile l'icona di salvataggio, attendi che scompaia.",
+                "¿Cerrar el juego ahora? El juego guarda automáticamente; si se ve el icono de guardado, espera a que desaparezca.",
+                "Fechar o jogo agora? O jogo salva automaticamente; se o ícone de salvamento estiver aparecendo, espere ele sumir.",
+                "Закрыть игру сейчас? Игра сохраняется автоматически; если виден значок сохранения, дождитесь, пока он исчезнет.",
+                "ゲームを終了しますか？ ゲームは自動でセーブされます。セーブ中のアイコンが表示されている場合は、消えるまで待ってください。",
+                "지금 게임을 종료할까요? 게임은 자동으로 저장됩니다. 저장 아이콘이 보이면 사라질 때까지 기다리세요.",
+                "现在关闭游戏吗？游戏会自动存档；如果正在显示存档图标，请等它消失后再退出。",
+                "現在關閉遊戲嗎？遊戲會自動存檔；如果正在顯示存檔圖示，請等它消失後再結束。");
+        put("exit_yes", "Exit", "Quitter", "Beenden", "Esci", "Salir", "Sair", "Выйти", "終了", "종료", "退出", "結束");
         put("cancel", "Cancel", "Annuler", "Abbrechen", "Annulla", "Cancelar", "Cancelar", "Отмена", "キャンセル", "취소",
                 "取消", "取消");
 

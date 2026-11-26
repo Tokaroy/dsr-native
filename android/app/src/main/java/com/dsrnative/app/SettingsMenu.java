@@ -716,6 +716,44 @@ public final class SettingsMenu {
             mBody.addView(inst, ilp);
         }
         note(Strings.t("saved_in", sSettingsPath));
+
+        // Exit (TV boxes and controllers have no easy way to close the app); asks first, a stray press must not quit.
+        section(Strings.t("sec_exit"));
+        TextView exit = chip(Strings.t("exit_t"), false);
+        exit.setGravity(Gravity.CENTER);
+        exit.setOnClickListener(v -> confirmExit());
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        elp.topMargin = dp(8);
+        mBody.addView(exit, elp);
+    }
+
+    private void confirmExit() {
+        try {
+            AlertDialog d = new AlertDialog.Builder(mA, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle(Strings.t("exit_t"))
+                    .setMessage(Strings.t("exit_q"))
+                    .setPositiveButton(Strings.t("exit_yes"), (dlg, w) -> exitApp(mA))
+                    .setNegativeButton(Strings.t("cancel"), null)
+                    .create();
+            GameActivity.showImmersive(d);
+        } catch (Exception e) {
+            exitApp(mA);
+        }
+    }
+
+    /** Ends the game: the keep-alive notification, the task and the process (the game's threads do not stop). */
+    static void exitApp(Activity a) {
+        try {
+            KeepAliveService.apply(a, false);
+        } catch (Exception ignored) {
+        }
+        try {
+            a.finishAndRemoveTask();
+        } catch (Exception ignored) {
+        }
+        new android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 300);
     }
 
     // ---- render scale -------------------------------------------------------------------------------------------
