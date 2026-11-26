@@ -600,6 +600,7 @@ struct Image {
     bool mutable_fmt = false;  // created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT (views in `twin` allowed)
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     uint64_t attached_list = 0;  // the list it was last attached to a render pass in (see WaitForOneShot)
+    uint64_t uid = 0;  // unique per created image (a write-back is delivered only to the image it was read from)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
@@ -2930,6 +2931,7 @@ private:
         if (images_created_++ < 48)
             LOGI(kTag, "image %dx%d%s NVN format %d (target %d, %d levels, %d layers) -> Vulkan format %d", img.width,
                  img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, vf);
+        img.uid = ++image_uids_;
         return &(images_[t.addr] = img);
     }
 
@@ -3966,6 +3968,15 @@ private:
                 continue;
             }
             if (rb.texture) {
+                // Delivered a few lists after the read (when the slot's fence is waited for). If the game has
+                // used that memory as another texture since (streaming in a new area), the render target is
+                // gone: writing its old pixels there overwrote the new texture's data, which the game never
+                // loads again, and the texture showed as garbage or see-through holes until a restart.
+                const auto cur = images_.find(rb.dst);
+                if (cur == images_.end() || cur->second.uid != rb.image_uid || cur->second.cpu_source) {
+                    stale_writebacks_++;
+                    continue;
+                }
                 const TextureLayout layout = ComputeLayout(rb.tex);
                 if (layout.levels.empty() || !GuestRangeValid(rb.dst, layout.levels[0].offset + layout.levels[0].size))
                     continue;
@@ -4476,6 +4487,7 @@ private:
     // game computes its auto exposure that way (it stayed at its default without it: too dark).
     static constexpr size_t kWritebackTexels = 64 * 64;
     std::unordered_set<Image*> small_rts_;
+    uint64_t image_uids_ = 0, stale_writebacks_ = 0;
     void WriteBackSmallTargets() {
         if (small_rts_.empty()) return;
         for (Image* img : small_rts_) {
@@ -4500,6 +4512,7 @@ private:
             Readback rb{off, img->addr, row, rows, 1, row, row * rows};
             rb.texture = true;
             rb.tex = img->tex;
+            rb.image_uid = img->uid;
             slots_[slot_].readbacks.push_back(rb);
         }
         small_rts_.clear();
@@ -6688,14 +6701,14 @@ private:
     // face is drawn into its texture when a character loads: skipped, the texture kept garbage). A draw into a
     // target that was not drawn into in the last 2 lists waits for its pipeline.
     // Diagnostics (face texture): draws into small colour targets (up to 256x256) not drawn in the last 2 lists
-    // are logged (the first 60 targets), and those targets are written back to game memory after the list, so a
-    // frame capture's "game memory means" shows what the GPU drew there.
+    // are logged (the first 60 targets). (They were also written back to game memory after the list, for frame
+    // captures. Those targets' memory is often reused for streamed textures: a write-back landing after that
+    // overwrote textures of the new area. Only the 64x64 exposure targets are written back now.)
     std::unordered_set<uint64_t> one_shot_logged_;
     void LogOneShotDraw(const DrawParams& p, const std::vector<Image*>& colors, const Image* depth) {
         for (size_t i = 0; i < colors.size(); i++) {
             Image* c = colors[i];
             if (!c || c->attached_list + 2 >= list_counter_ || size_t(c->width) * c->height > 256 * 256) continue;
-            if (c->type == VK_IMAGE_TYPE_2D && !IsDepthFormat(c->nvn_format)) small_rts_.insert(c);
             if (one_shot_logged_.size() >= 60 || !one_shot_logged_.insert(c->addr ^ list_counter_ << 40).second) continue;
             const uint64_t vsh = st_.program[0] ? st_.program[0]->hash : 0, fsh = st_.program[1] ? st_.program[1]->hash : 0;
             LOGI(kTag, "draw into a texture not drawn recently: rt%zu fmt %d %dx%d @%llx (%s) | vs %016llx fs %016llx | "
@@ -7565,9 +7578,10 @@ private:
             bg_ms_ = 0;
         }
         if (rt_writebacks_ || reports_done_) {
-            LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
-                 (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);
-            rt_writebacks_ = reports_done_ = 0;
+            LOGI(kTag, "small render targets written back to game memory: %llu (%llu dropped: memory reused); reports "
+                 "written: %llu", (unsigned long long)rt_writebacks_, (unsigned long long)stale_writebacks_,
+                 (unsigned long long)reports_done_);
+            rt_writebacks_ = reports_done_ = stale_writebacks_ = 0;
         }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
@@ -8641,6 +8655,7 @@ private:
         TextureState tex{};
         int report = -1;       // 0: write the 32-bit `value`; 1: write a counter report {counter, timestamp}
         uint32_t value = 0;
+        uint64_t image_uid = 0;  // texture write-backs: the image read (Image::uid)
     };
     struct Slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
