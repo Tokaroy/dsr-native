@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include "hle/nvn/layout.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/registry.h"
+#include "hle/os/os.h"
 #include "loader/dynamic_thunks.h"
 #include "loader/nso.h"
 #include "loader/sha256.h"
@@ -154,6 +156,21 @@ static void TestOsSync() {
         });
     for (auto& t : ts) t.join();
     CHECK(counter == 80000);
+
+    // Diagnostics: a thread blocked on a held mutex is listed with its wait (DumpGuestThreads must not crash).
+    lock(mutex);
+    std::atomic<bool> got_lock{false};
+    std::thread blocked([&] {
+        lock(mutex);
+        got_lock = true;
+        unlock(mutex);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    dsr::hle::os::DumpGuestThreads("test");
+    CHECK(!got_lock);
+    unlock(mutex);
+    blocked.join();
+    CHECK(got_lock);
 
     // Event: auto-clear wakes exactly one waiter per signal.
     using EventInit = void (*)(void*, bool, int);

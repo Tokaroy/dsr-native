@@ -29,6 +29,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "hle/os/os.h"
 #include "common/log.h"
 #include "common/platform.h"
 #include "common/profiler.h"
@@ -781,12 +782,16 @@ int SyncWait(const void* sync, uint64_t timeout_ns) {
     if (logged < 6 && logged++ < 6)
         LOGI(kTag, "nvnSyncWait(%p): %s", sync, !target ? "no pending work" : Queue().Completed() >= target ? "already done" : "waits");
     if (!target || Queue().Completed() >= target) return 0;
+    DSR_NOTE_WAIT("nvnSyncWait", sync);
+    os::BlockedScope blocked;
     WaitTimer wt{1};
     const auto timeout = timeout_ns >= uint64_t(INT64_MAX) ? std::chrono::nanoseconds::max()
                                                            : std::chrono::nanoseconds(int64_t(timeout_ns));
     return Queue().Wait(target, timeout) ? 1 : 2;
 }
-void QueueFinish(void* /*queue*/) {
+void QueueFinish(void* queue) {
+    DSR_NOTE_WAIT("nvnQueueFinish", queue);
+    os::BlockedScope blocked;
     WaitTimer wt{1};
     Queue().Wait(Queue().Submitted());
 }

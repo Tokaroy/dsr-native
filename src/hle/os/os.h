@@ -45,6 +45,22 @@ T& FieldAt(void* base, size_t off) {
     return *reinterpret_cast<T*>(static_cast<uint8_t*>(base) + off);
 }
 
+// ---- diagnostics: what each guest thread waits in (stuck loading screens) ------------------------
+// The nn::os wait functions note what they were called for and from where (a few stores, no clock read); the
+// points that actually block (futex waits, host condition variables, sleeps) mark the thread blocked with the
+// time. DumpGuestThreads logs every guest thread: blocked for how long, in what, called from where.
+void NoteWaitCall(const char* kind, const void* obj, uintptr_t ret, uintptr_t frame);
+void NoteBlocked(bool blocked);
+struct BlockedScope {
+    BlockedScope() { NoteBlocked(true); }
+    ~BlockedScope() { NoteBlocked(false); }
+};
+void DumpGuestThreads(const char* why);
+// In an HLE function the guest calls directly: its return address, and the caller's frame record (saved x29).
+#define DSR_NOTE_WAIT(kind, obj)                                                                    \
+    ::dsr::hle::os::NoteWaitCall(kind, obj, reinterpret_cast<uintptr_t>(__builtin_return_address(0)), \
+                                 *static_cast<const uintptr_t*>(__builtin_frame_address(0)))
+
 // ---- threads ------------------------------------------------------------------------------------
 using GuestThread = void;  // nn::os::ThreadType (opaque, 0x1C0 bytes on SDK 4.x)
 

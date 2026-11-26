@@ -49,6 +49,11 @@ struct HostThread {
     std::mutex m;
     std::atomic<uint32_t> state{0};
     std::atomic<bool> poller{false};  // see MarkPoller
+    // Diagnostics (NoteWaitCall / NoteBlocked / DumpGuestThreads): the last nn::os wait call, and since when the
+    // thread has been blocked (0: not blocked).
+    std::atomic<const char*> wait_kind{nullptr};
+    std::atomic<uintptr_t> wait_obj{0}, wait_ret{0}, wait_frame{0};
+    std::atomic<int64_t> blocked_since{0}, unblocked_at{0};
 };
 
 std::mutex g_threads_mutex;
@@ -218,6 +223,7 @@ HLE_FUNC(_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE, void, nn_os_StartThread, (Gu
 HLE_ALIAS(nnosStartThread, nn_os_StartThread);
 
 HLE_FUNC(_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE, void, nn_os_WaitThread, (GuestThread * t)) {
+    DSR_NOTE_WAIT("WaitThread", t);
     HostThread* ht = Lookup(t);
     if (!ht) return;
     uint32_t s;
@@ -360,6 +366,75 @@ void RecordSleep(uintptr_t ret, uintptr_t frame, int64_t ns) {
 }  // namespace dsr::hle::os
 
 namespace dsr::hle::os {
+void NoteWaitCall(const char* kind, const void* obj, uintptr_t ret, uintptr_t frame) {
+    if (!t_current) CurrentThread();  // only nn::os entry points call this: a guest thread (adopted on first use)
+    HostThread* t = t_current;
+    if (!t) return;
+    t->wait_kind.store(kind, std::memory_order_relaxed);
+    t->wait_obj.store(reinterpret_cast<uintptr_t>(obj), std::memory_order_relaxed);
+    t->wait_ret.store(ret, std::memory_order_relaxed);
+    t->wait_frame.store(frame, std::memory_order_relaxed);
+}
+
+void NoteBlocked(bool blocked) {
+    HostThread* t = t_current;
+    if (!t) return;
+    const int64_t now = NowNs();  // only on the blocking path (a futex or a sleep follows)
+    if (blocked) {
+        if (!t->blocked_since.load(std::memory_order_relaxed)) t->blocked_since.store(now, std::memory_order_relaxed);
+    } else {
+        t->blocked_since.store(0, std::memory_order_relaxed);
+        t->unblocked_at.store(now, std::memory_order_relaxed);
+    }
+}
+
+void DumpGuestThreads(const char* why) {
+    const int64_t now = NowNs();
+    std::vector<HostThread*> threads;
+    std::unordered_map<uintptr_t, std::string> names;  // guest ThreadType* -> name (mutex owners)
+    {
+        std::lock_guard<std::mutex> lk(g_threads_mutex);
+        for (auto& [g, ht] : g_threads) {
+            names[reinterpret_cast<uintptr_t>(g)] = ht->name;
+            if (ht->state.load() != uint32_t(State::Exited)) threads.push_back(ht.get());
+        }
+    }
+    std::sort(threads.begin(), threads.end(), [](HostThread* a, HostThread* b) {
+        return a->blocked_since.load() == 0 && b->blocked_since.load() != 0;  // running ones first
+    });
+    LOGW(kTag, "guest threads (%s): %zu", why, threads.size());
+    for (HostThread* t : threads) {
+        const char* kind = t->wait_kind.load(std::memory_order_relaxed);
+        const uintptr_t obj = t->wait_obj.load(std::memory_order_relaxed);
+        const uintptr_t ret = t->wait_ret.load(std::memory_order_relaxed);
+        const uintptr_t frame = t->wait_frame.load(std::memory_order_relaxed);
+        const int64_t since = t->blocked_since.load(std::memory_order_relaxed);
+        const int64_t until = t->unblocked_at.load(std::memory_order_relaxed);
+        char extra[160] = "";
+        if (since) {
+            // Blocked: its stack holds still, so the caller's caller can be read from the frame record.
+            uintptr_t ret2 = 0;
+            if (frame >= t->stack_lo && frame + 16 <= t->stack_hi) ret2 = *reinterpret_cast<const uintptr_t*>(frame + 8);
+            if (kind && obj && !std::strcmp(kind, "LockMutex")) {  // MutexType: owner ThreadType* at +0x10
+                const uintptr_t owner = reinterpret_cast<std::atomic<uintptr_t>*>(obj + 0x10)->load();
+                auto it = names.find(owner);
+                std::snprintf(extra, sizeof extra, ", held by '%s'",
+                              owner ? (it != names.end() ? it->second.c_str() : "?") : "nobody");
+            } else if (kind && obj && !std::strcmp(kind, "WaitEvent")) {  // EventType: signaled flag at +0x10
+                std::snprintf(extra, sizeof extra, ", event %s",
+                              *reinterpret_cast<const bool*>(obj + 0x10) ? "signaled" : "not signaled");
+            }
+            LOGW(kTag, "  '%s': blocked %.1f s in %s(0x%lx) from main+0x%lx (from main+0x%lx)%s", t->name.c_str(),
+                 (now - since) / 1e9, kind ? kind : "a host wait", (unsigned long)obj, (unsigned long)MainOffset(ret),
+                 (unsigned long)MainOffset(ret2), extra);
+        } else {
+            LOGW(kTag, "  '%s': running; last nn::os wait %s(0x%lx) from main+0x%lx, %.1f s ago", t->name.c_str(),
+                 kind ? kind : "(none)", (unsigned long)obj, (unsigned long)MainOffset(ret),
+                 until ? (now - until) / 1e9 : -1.0);
+        }
+    }
+}
+
 // From GetSystemTick: a poller thread (MarkPoller; the game is offline, so its network timing does not matter) that
 // has run 0.5 ms without sleeping naps 5 ms. That bounds it to about a tenth of a core (1.5 ms naps still left it
 // 1.5-2.4 s of CPU per 10 s on a Mali phone); the nap is short enough in case it holds a lock the game takes.
@@ -391,8 +466,12 @@ HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t
         sched_yield();
         return;
     }
+    DSR_NOTE_WAIT("SleepThread", reinterpret_cast<const void*>(ns));
     timespec ts{time_t(ns / 1'000'000'000), long(ns % 1'000'000'000)};
-    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+    {
+        BlockedScope blocked;
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+        }
     }
     t_poller_run_start = 0;
 }

@@ -577,6 +577,33 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         ft_n++;
         if (ms > 2.0 * 1000.0 / fps) ft_hitches++;
         step_sum += dsr::GameFrameTime();  // set by the game's frame limiter (60 fps mode)
+
+        // Diagnostics (a loading screen that never ends, G68 log: 90 s after a death with the loader threads idle):
+        // once the game has drawn the world (a frame of 300+ draws), 12 s of light frames (under 200 draws: loading
+        // screens, the title screen) log what every game thread is waiting in; again every 30 s while it lasts (4
+        // times at most), until a frame of 200+ draws. A few log lines; nothing is measured on the way.
+        static uint64_t last_draws = 0;
+        static bool world_seen = false;
+        static double light_s = 0, next_dump_s = 12;
+        static int dumps = 0;
+        const uint64_t draws = Stats().draws, frame_draws = draws - last_draws;
+        last_draws = draws;
+        if (frame_draws >= 300) world_seen = true;
+        if (frame_draws >= 200) {
+            light_s = 0;
+            next_dump_s = 12;
+            dumps = 0;
+        } else if (world_seen) {
+            light_s += std::min(ms, 100.0) / 1000.0;  // a pause or a stall counts as one frame
+            if (light_s >= next_dump_s && dumps < 4) {
+                dumps++;
+                next_dump_s += 30;
+                char why[96];
+                std::snprintf(why, sizeof why, "%.0f s of light frames (%llu draws): a loading screen?", light_s,
+                              (unsigned long long)frame_draws);
+                os::DumpGuestThreads(why);
+            }
+        }
     }
     static bool caller_logged = false;
     if (!caller_logged) {

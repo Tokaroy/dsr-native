@@ -28,6 +28,7 @@ bool FutexWait(std::atomic<uint32_t>* addr, uint32_t expected, int64_t timeout_n
         ts.tv_nsec = timeout_ns % 1'000'000'000;
         pts = &ts;
     }
+    BlockedScope blocked;  // diagnostics (DumpGuestThreads)
     long r = syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr), FUTEX_WAIT_PRIVATE, expected, pts, nullptr, 0);
     return !(r == -1 && errno == ETIMEDOUT);
 }
