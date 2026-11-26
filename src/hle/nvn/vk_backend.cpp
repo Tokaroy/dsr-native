@@ -2260,7 +2260,16 @@ private:
     // camera pans judder). ANativeWindow_setFrameRate is API 30+: looked up at run time.
     void SetWindowFrameRate() {
         using Fn = int32_t (*)(ANativeWindow*, float, int8_t);
-        static Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate"));
+        // Looked up in libandroid.so itself: it is not in the global symbol scope our library sees, so a lookup
+        // with RTLD_DEFAULT failed on every device (an AYN Thor on Android 13 logged "not available"), and the
+        // display kept its own rate (60 fps frames on a faster panel: judder in camera pans).
+        static Fn fn = [] {
+            void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+            if (!lib) lib = dlopen("libandroid.so", RTLD_NOW);
+            void* f = lib ? dlsym(lib, "ANativeWindow_setFrameRate") : nullptr;
+            if (!f) f = dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate");
+            return reinterpret_cast<Fn>(f);
+        }();
         const float fps = float(dsr::FixedFps(dsr::GetRuntime().config));
         if (!fn) {
             LOGI(kTag, "ANativeWindow_setFrameRate not available: display rate left to the system");
