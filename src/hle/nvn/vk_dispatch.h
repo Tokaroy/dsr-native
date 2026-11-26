@@ -10,6 +10,7 @@
 // Instance and physical-device level (vkGetInstanceProcAddr(instance, ...)).
 #define DSR_VK_INSTANCE_FUNCS(X)                  \
     X(vkEnumeratePhysicalDevices)                 \
+    X(vkDestroyInstance)                          \
     X(vkGetPhysicalDeviceProperties)              \
     X(vkGetPhysicalDeviceFeatures2)               \
     X(vkGetPhysicalDeviceFormatProperties)        \

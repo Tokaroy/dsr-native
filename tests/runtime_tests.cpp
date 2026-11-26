@@ -28,6 +28,7 @@ static int g_failures = 0;
 #include "hle/nvn/astc_encode.h"
 #include "hle/nvn/etc_encode.h"
 #include "hle/nvn/parallel.h"
+#include "hle/nvn/bc_decode.h"
 #include "hle/nvn/tex_disk_cache.h"
 #include "runtime/cheat_vm.h"
 
@@ -805,6 +806,132 @@ public:
 };
 }  // namespace
 
+// BC7 / BC6H software decoding (pull request #94): blocks written bit by bit from the format specification
+// (independently of the decoder's tables), decoded, compared with the specification's arithmetic.
+struct BitWriter {
+    uint8_t b[16] = {};
+    int pos = 0;
+    void Put(uint32_t v, int n) {
+        for (int i = 0; i < n; i++, pos++)
+            if ((v >> i) & 1) b[pos >> 3] |= uint8_t(1 << (pos & 7));
+    }
+};
+static int Interp(int a, int c, int w) { return (a * (64 - w) + c * w + 32) >> 6; }
+static void TestBc7Bc6h() {
+    using dsr::hle::nvn::BcDecode;
+    using dsr::hle::nvn::BcKind;
+    static const int kW2[4] = {0, 21, 43, 64}, kW3[8] = {0, 9, 18, 27, 37, 46, 55, 64},
+                     kW4[16] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+    uint8_t out[16 * 8];
+    // BC7 mode 6: one subset, RGBA 7 bits + a p-bit per endpoint, 4-bit indices (texel 0: 3 bits).
+    {
+        const int e0[4] = {10, 100, 50, 127}, e1[4] = {120, 5, 90, 64}, p0 = 1, p1 = 0;
+        BitWriter w;
+        w.Put(1u << 6, 7);
+        for (int c = 0; c < 4; c++) {
+            w.Put(uint32_t(e0[c]), 7);
+            w.Put(uint32_t(e1[c]), 7);
+        }
+        w.Put(p0, 1);
+        w.Put(p1, 1);
+        int idx[16];
+        for (int i = 0; i < 16; i++) idx[i] = i == 0 ? 5 : (i * 7) & 15;
+        for (int i = 0; i < 16; i++) w.Put(uint32_t(idx[i]), i == 0 ? 3 : 4);
+        CHECK(w.pos == 128);
+        BcDecode(BcKind::BC7, w.b, 1, 1, out, 4, 4);
+        bool ok = true;
+        for (int i = 0; i < 16; i++)
+            for (int c = 0; c < 4; c++)
+                ok &= out[i * 4 + c] == Interp(e0[c] << 1 | p0, e1[c] << 1 | p1, kW4[idx[i]]);
+        CHECK(ok);
+    }
+    // BC7 mode 5: rotation 0, RGB 7 bits (expanded), alpha 8 bits, separate 2-bit colour and alpha indices.
+    {
+        const int e0[3] = {3, 64, 127}, e1[3] = {90, 0, 33}, a0 = 200, a1 = 17;
+        BitWriter w;
+        w.Put(1u << 5, 6);
+        w.Put(0, 2);
+        for (int c = 0; c < 3; c++) {
+            w.Put(uint32_t(e0[c]), 7);
+            w.Put(uint32_t(e1[c]), 7);
+        }
+        w.Put(a0, 8);
+        w.Put(a1, 8);
+        int ci[16], ai[16];
+        for (int i = 0; i < 16; i++) ci[i] = i == 0 ? 1 : i & 3, ai[i] = i == 0 ? 0 : (3 - (i & 3));
+        for (int i = 0; i < 16; i++) w.Put(uint32_t(ci[i]), i == 0 ? 1 : 2);
+        for (int i = 0; i < 16; i++) w.Put(uint32_t(ai[i]), i == 0 ? 1 : 2);
+        CHECK(w.pos == 128);
+        BcDecode(BcKind::BC7, w.b, 1, 1, out, 4, 4);
+        auto x7 = [](int v) { return v << 1 | v >> 6; };
+        bool ok = true;
+        for (int i = 0; i < 16; i++) {
+            for (int c = 0; c < 3; c++) ok &= out[i * 4 + c] == Interp(x7(e0[c]), x7(e1[c]), kW2[ci[i]]);
+            ok &= out[i * 4 + 3] == Interp(a0, a1, kW2[ai[i]]);
+        }
+        CHECK(ok);
+    }
+    // BC7 mode 1, partition 0 (texels in columns 2-3 are subset 1; anchors 0 and 15): RGB 6 bits + a shared
+    // p-bit per subset, 3-bit indices.
+    {
+        const int e[4][3] = {{1, 20, 63}, {40, 33, 0}, {63, 10, 5}, {7, 50, 31}}, pb[2] = {1, 0};
+        BitWriter w;
+        w.Put(1u << 1, 2);
+        w.Put(0, 6);
+        for (int c = 0; c < 3; c++)
+            for (int k = 0; k < 4; k++) w.Put(uint32_t(e[k][c]), 6);
+        w.Put(pb[0], 1);
+        w.Put(pb[1], 1);
+        int idx[16];
+        for (int i = 0; i < 16; i++) idx[i] = (i == 0 || i == 15) ? 3 : (i * 3) & 7;
+        for (int i = 0; i < 16; i++) w.Put(uint32_t(idx[i]), (i == 0 || i == 15) ? 2 : 3);
+        CHECK(w.pos == 128);
+        BcDecode(BcKind::BC7, w.b, 1, 1, out, 4, 4);
+        auto ep = [&](int k, int c) {
+            const int v = e[k][c] << 1 | pb[k / 2];
+            return v << 1 | v >> 6;
+        };
+        bool ok = true;
+        for (int i = 0; i < 16; i++) {
+            const int s = (i & 3) >= 2;
+            for (int c = 0; c < 3; c++) ok &= out[i * 4 + c] == Interp(ep(2 * s, c), ep(2 * s + 1, c), kW3[idx[i]]);
+            ok &= out[i * 4 + 3] == 255;
+        }
+        CHECK(ok);
+    }
+    // BC6H unsigned, mode 11 (bits 00011): one subset, 10-bit endpoints, no delta transform, 4-bit indices.
+    {
+        const int e0[3] = {0, 300, 1023}, e1[3] = {512, 1, 77};
+        BitWriter w;
+        w.Put(0x03, 5);
+        for (int c = 0; c < 3; c++) w.Put(uint32_t(e0[c]), 10);
+        for (int c = 0; c < 3; c++) w.Put(uint32_t(e1[c]), 10);
+        int idx[16];
+        for (int i = 0; i < 16; i++) idx[i] = i == 0 ? 6 : (i * 5) & 15;
+        for (int i = 0; i < 16; i++) w.Put(uint32_t(idx[i]), i == 0 ? 3 : 4);
+        CHECK(w.pos == 128);
+        BcDecode(BcKind::BC6H_U, w.b, 1, 1, out, 4, 4);
+        auto unq = [](int v) { return v == 0 ? 0 : v == 1023 ? 0xffff : ((v << 16) + 0x8000) >> 10; };
+        bool ok = true;
+        for (int i = 0; i < 16; i++) {
+            uint16_t h[4];
+            memcpy(h, out + i * 8, 8);
+            for (int c = 0; c < 3; c++) ok &= h[c] == uint16_t((Interp(unq(e0[c]), unq(e1[c]), kW4[idx[i]]) * 31) >> 6);
+            ok &= h[3] == 0x3c00;
+        }
+        CHECK(ok);
+    }
+    // Reserved BC7 mode (first byte 0): transparent black, not garbage.
+    {
+        uint8_t z[16] = {};
+        memset(out, 0xab, sizeof(out));
+        BcDecode(BcKind::BC7, z, 1, 1, out, 4, 4);
+        bool ok = true;
+        for (int i = 0; i < 64; i++) ok &= out[i] == 0;
+        CHECK(ok);
+    }
+}
+
 static void TestTexDiskCache() {
     using dsr::hle::nvn::TexDiskCache;
     char tmpl[] = "/tmp/dsr_tex_cache_XXXXXX";
@@ -1033,6 +1160,7 @@ int main() {
         {"etc_encode", TestEtcEncode},
         {"astc_encode", TestAstcEncode},
         {"astc_block_sizes", TestAstcBlockSizes},
+        {"bc7_bc6h", TestBc7Bc6h},
         {"tex_disk_cache", TestTexDiskCache},
         {"cheats", TestCheats},
 #if defined(__aarch64__)

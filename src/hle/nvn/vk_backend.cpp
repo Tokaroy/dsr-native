@@ -69,16 +69,21 @@ constexpr const char* kTag = "vulkan";
 
 // Opens the Vulkan driver: a custom one (settings.txt `gpu_driver`, prepared by the Android front end into the
 // app's private folder) through libadrenotools, or the system's libvulkan. Loads the global entry points.
+int g_vk_lib_state = 0;        // 0 = not tried, 1 = loaded, 2 = failed
+bool g_custom_driver = false;  // the Vulkan functions come from a custom driver (settings gpu_driver)
+bool g_system_driver_only = false;
 bool LoadVulkanLibrary() {
-    static int state = 0;  // 0 = not tried, 1 = loaded, 2 = failed
+    int& state = g_vk_lib_state;
     if (state) return state == 1;
     state = 2;
     const RuntimeConfig& cfg = GetRuntime().config;
     void* lib = nullptr;
-    if (!cfg.gpu_driver_lib.empty()) {
+    g_custom_driver = false;
+    if (!cfg.gpu_driver_lib.empty() && !g_system_driver_only) {
         lib = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
                                          (cfg.native_lib_dir + "/").c_str(), cfg.gpu_driver_dir.c_str(),
                                          cfg.gpu_driver_lib.c_str(), nullptr, nullptr);
+        g_custom_driver = lib != nullptr;
         if (lib)
             LOGI(kTag, "custom GPU driver: %s (%s) loaded through libadrenotools", cfg.gpu_driver.c_str(),
                  cfg.gpu_driver_lib.c_str());
@@ -1741,7 +1746,24 @@ private:
     // ======================================================================================================
     // device
     // ======================================================================================================
+    // A custom driver (settings gpu_driver) that loads but cannot make an instance or a device on this GPU (for
+    // example malisx2 or Turnip on a GPU they do not support): the system driver is used instead of no graphics.
     bool EnsureDevice() {
+        if (device_) return true;
+        if (init_failed_) return false;
+        if (EnsureDeviceOnce()) return true;
+        if (!g_custom_driver || device_) return false;
+        LOGW(kTag, "custom GPU driver %s could not start on this GPU: using the system driver",
+             GetRuntime().config.gpu_driver.c_str());
+        if (instance_ && vkDestroyInstance) vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+        phys_ = VK_NULL_HANDLE;
+        g_system_driver_only = true;
+        g_vk_lib_state = 0;
+        init_failed_ = false;
+        return EnsureDeviceOnce();
+    }
+    bool EnsureDeviceOnce() {
         if (device_) return true;
         if (init_failed_) return false;
         init_failed_ = true;  // cleared on success
