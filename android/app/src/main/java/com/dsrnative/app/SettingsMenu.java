@@ -530,6 +530,9 @@ public final class SettingsMenu {
         final int maliFirst = mBody.getChildCount() + 1;  // after the group's header row
         TextView maliHeader = subsection(Strings.t("sec_mali"));
         note(Strings.t("gpu_n"));
+        choice("mali_bc", Strings.t("malibc_t"), Strings.t("malibc_n") + " " + Strings.t("changes_next"),
+                new String[] {"0", "1", "2"},
+                new String[] {Strings.t("malibc_0"), Strings.t("malibc_1"), Strings.t("malibc_2")}, "0");
         toggle("bc3_etc2", Strings.t("bc3_t"), Strings.t("bc3_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         toggle("bc_astc", Strings.t("astc_t"), Strings.t("astc_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         choice("astc_block", Strings.t("astcb_t"), Strings.t("astcb_n") + " " + Strings.t("changes_next"),
@@ -550,7 +553,17 @@ public final class SettingsMenu {
     // ---- Driver tab ---------------------------------------------------------------------------------------------
 
     // Drivers that come with the app (assets/drivers/<name>.zip; the native side copies them out of the APK).
-    private static final String[] BUNDLED_DRIVERS = {"Turnip_Gen8_V39"};
+    private static final String[] BUNDLED_DRIVERS = {"Turnip_Gen8_V39", "malisx2"};
+
+    // A bundled driver is offered only when its zip is really in the APK (malisx2.zip is added at build time).
+    private boolean hasBundledAsset(String name) {
+        try {
+            String[] f = mA.getAssets().list("drivers");
+            if (f != null) for (String x : f) if (x.equals(name + ".zip")) return true;
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
 
     private static boolean isBundledDriver(String d) {
         for (String b : BUNDLED_DRIVERS) if (b.equals(d)) return true;
@@ -570,7 +583,7 @@ public final class SettingsMenu {
         if (chosen == null || chosen.isEmpty()) chosen = "system";
         List<String> drivers = new ArrayList<>();
         drivers.add("system");
-        for (String b : BUNDLED_DRIVERS) drivers.add(b);
+        for (String b : BUNDLED_DRIVERS) if (hasBundledAsset(b) || b.equals(chosen)) drivers.add(b);
         File dir = new File(sDriversDir);
         File[] files = dir.listFiles();
         if (files != null) {
