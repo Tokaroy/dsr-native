@@ -1120,6 +1120,22 @@ final class Strings {
                 "높음 (게임 기본값)",
                 "高（游戏默认）",
                 "高（遊戲預設）");
+        put("prepass_all", "All", "Tout", "Alle", "Tutti", "Todos", "Todos", "Все", "すべて", "전체", "全部", "全部");
+        put("prepass_alpha", "Alpha-tested only", "Alpha-test seulement", "Nur Alpha-Test", "Solo alpha test",
+                "Solo con alpha test", "Só com alpha test", "Только с альфа-тестом", "アルファテストのみ", "알파 테스트만",
+                "仅 Alpha 测试", "僅 Alpha 測試");
+        put("prepass_alpha_n",
+                "Alpha-tested only skips just the foliage, fences and other cut-out objects there (the costly part) and keeps the rest.",
+                "Alpha-test seulement ne retire que le feuillage, les grilles et autres objets découpés (la partie coûteuse) et garde le reste.",
+                "Nur Alpha-Test lässt dort nur Laub, Zäune und andere ausgeschnittene Objekte weg (der teure Teil) und behält den Rest.",
+                "Solo alpha test salta solo fogliame, recinzioni e altri oggetti ritagliati (la parte costosa) e mantiene il resto.",
+                "Solo con alpha test omite solo el follaje, las vallas y otros objetos recortados (la parte costosa) y mantiene el resto.",
+                "Só com alpha test pula apenas folhagem, cercas e outros objetos recortados (a parte cara) e mantém o resto.",
+                "«Только с альфа-тестом» пропускает лишь листву, решётки и другие вырезанные объекты (самую затратную часть), остальное сохраняется.",
+                "「アルファテストのみ」は葉や柵などの切り抜きオブジェクト (負荷の大きい部分) だけを省き、残りは維持します。",
+                "'알파 테스트만'은 나뭇잎, 울타리 등 잘라낸 오브젝트(비용이 큰 부분)만 건너뛰고 나머지는 유지합니다.",
+                "“仅 Alpha 测试”只跳过树叶、栅栏等镂空物体（开销大的部分），其余保留。",
+                "「僅 Alpha 測試」只略過樹葉、柵欄等鏤空物件（開銷大的部分），其餘保留。");
         put("prepass_t",
                 "Skip depth prepass",
                 "Sauter la pré-passe de profondeur",

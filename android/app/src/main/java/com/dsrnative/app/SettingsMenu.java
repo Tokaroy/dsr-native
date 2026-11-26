@@ -554,7 +554,9 @@ public final class SettingsMenu {
                 new String[] {"512 MB", "1024 MB", "256 MB", Strings.t("off")}, "512");
         toggle("mali_barriers", Strings.t("malib_t"), Strings.t("malib_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
-        toggle("skip_prepass", Strings.t("prepass_t"), Strings.t("prepass_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        choice("skip_prepass", Strings.t("prepass_t"), Strings.t("prepass_n") + " " + Strings.t("prepass_alpha_n") + " "
+                + Strings.t("changes_next"), new String[] {"0", "2", "1"},
+                new String[] {Strings.t("off"), Strings.t("prepass_alpha"), Strings.t("prepass_all")}, "0");
         toggle("mali_tile_turbo", Strings.t("turbo_t"), Strings.t("turbo_n") + " " + Strings.t("changes_next"), "1",
                 "0", "0");
         toggle("late_depth", Strings.t("ldepth_t"), Strings.t("ldepth_n") + " " + Strings.t("changes_next"), "1",

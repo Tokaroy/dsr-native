@@ -5411,18 +5411,29 @@ private:
                     prepass_keys_frame_ = occ_frame_;
                 }
                 const uint64_t pkey = PrepassKey(p, depth->addr);
+                if (prepass_skip_keys_frame_ != occ_frame_) {
+                    prepass_skip_keys_.clear();
+                    prepass_skip_keys_frame_ = occ_frame_;
+                }
                 if (depth_only) {
                     ps.pre++;
                     if (prepass_keys_.size() < 8192) prepass_keys_.insert(pkey);
-                    if (ps.learned) {
+                    // 2: only alpha-tested depth-only draws (alpha test, or a shader that discards) are left out.
+                    const bool alpha_tested =
+                        st_.color.alpha_func != 8 || (st_.program[1] && fs && fs->info.uses_discard);
+                    if (ps.learned && (dsr::GetRuntime().config.skip_prepass == 1 || alpha_tested)) {
+                        if (prepass_skip_keys_.size() < 8192) prepass_skip_keys_.insert(pkey);
                         prepass_skipped_++;
                         return;
                     }
+                    if (ps.learned) prepass_kept_++;
                 } else {
                     ps.main++;
                     const bool twin = prepass_keys_.count(pkey) != 0;
                     if (twin) ps.matched++;
-                    if (ps.learned) {
+                    if (ps.learned && twin && !prepass_skip_keys_.count(pkey)) {
+                        // Its depth-only twin was drawn: the depth is already there (the game's state as is).
+                    } else if (ps.learned) {
                         if (twin) {
                             st_.depth.depth_write = true;  // restored when this draw is done (ForceDepthWrite)
                             force_depth_write.p = &st_.depth.depth_write;
@@ -7452,10 +7463,12 @@ private:
             LOGI(kTag, "shadow_quality 0: %llu shadow map draws left out (last 10 s)", (unsigned long long)shadow_draws_skipped_);
         shadow_draws_skipped_ = 0;
         if (dsr::GetRuntime().config.skip_prepass)
-            LOGI(kTag, "skip_prepass: %llu depth-only draws left out, %llu colour draws writing the depth, %llu colour draws "
-                 "without a twin (unchanged), %zu depth buffers tracked (last 10 s)", (unsigned long long)prepass_skipped_,
-                 (unsigned long long)prepass_converted_, (unsigned long long)prepass_unmatched_, prepass_.size());
-        prepass_skipped_ = prepass_converted_ = prepass_unmatched_ = 0;
+            LOGI(kTag, "skip_prepass %d: %llu depth-only draws left out, %llu kept, %llu colour draws writing the depth, "
+                 "%llu colour draws without a twin (unchanged), %zu depth buffers tracked (last 10 s)",
+                 dsr::GetRuntime().config.skip_prepass, (unsigned long long)prepass_skipped_,
+                 (unsigned long long)prepass_kept_, (unsigned long long)prepass_converted_,
+                 (unsigned long long)prepass_unmatched_, prepass_.size());
+        prepass_skipped_ = prepass_converted_ = prepass_unmatched_ = prepass_kept_ = 0;
         if (dsr::GetRuntime().config.skip_hidden)
             LOGI(kTag, "skip_hidden %s: %llu draws judged, %llu left out, %llu drawn with a visibility query (%llu of them "
                  "hidden ones while the camera moved), %llu kept until their retest's result, %llu came back into view, "
@@ -8329,7 +8342,9 @@ private:
     std::unordered_map<uint64_t, PrepassStat> prepass_;
     std::unordered_set<uint64_t> prepass_keys_;  // this frame's depth-only draws (mesh identity + depth buffer)
     uint32_t prepass_keys_frame_ = ~0u;
-    uint64_t prepass_skipped_ = 0, prepass_converted_ = 0, prepass_unmatched_ = 0;
+    uint64_t prepass_skipped_ = 0, prepass_converted_ = 0, prepass_unmatched_ = 0, prepass_kept_ = 0;
+    std::unordered_set<uint64_t> prepass_skip_keys_;  // this frame's depth-only draws left out (their twin writes depth)
+    uint32_t prepass_skip_keys_frame_ = ~0u;
     static uint64_t PrepassKey(const DrawParams& p, uint64_t depth_addr) {
         uint64_t h = 1469598103934665603ull;
         const auto mix = [&h](uint64_t v) {

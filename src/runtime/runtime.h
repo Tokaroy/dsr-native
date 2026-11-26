@@ -70,8 +70,10 @@ struct RuntimeConfig {
     // 3 = the game's 2048 (1024 with performance_mode).
     int shadow_quality = 3;
     // skip_prepass (experimental, for Mali): the game's depth-only world pass is left out and the colour pass writes
-    // the depth instead (vk_backend.cpp, PrepassStat).
-    bool skip_prepass = false;
+    // the depth instead (vk_backend.cpp, PrepassStat). 1 = all of it; 2 = only its alpha-tested draws (foliage,
+    // fences: in the depth-only pass they still run the texture fetch and discard, the expensive part of it), the
+    // plain opaque ones stay and keep hiding what is behind them.
+    int skip_prepass = 0;
     // skip_hidden (experimental): world draws that covered no pixel in recent frames (occlusion queries) are left
     // out, retested every few frames (vk_backend.cpp, OccDecide). 1 = gentle (nothing left out while the camera moves),
     // 2 = aggressive.
