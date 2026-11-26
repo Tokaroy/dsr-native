@@ -42,10 +42,6 @@ struct RuntimeConfig {
     // particles, fog: about once a frame), they get the copy made when that pass last ended (a frame old at first)
     // instead of the pass being split for a copy. May show slight edge errors on soft particles in fast motion.
     bool late_depth = false;
-    // relaxed_precision (experimental): fragment shader arithmetic that only feeds colours may run in 16 bits
-    // (RelaxedPrecision; Adreno and Mali do half-precision maths about twice as fast). Texture coordinates,
-    // comparisons and depth stay 32-bit. May show banding in dark gradients.
-    bool relaxed_precision = false;
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
     std::string present_mode = "fifo";  // swapchain present mode: fifo (vsync, default), mailbox, fifo_relaxed, immediate (FIFO if unsupported)

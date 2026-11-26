@@ -164,23 +164,12 @@ public:
                             op == SpvOpVectorTimesScalar || op == SpvOpDot))
             Decorate(id, SpvDecorationNoContraction, {});
     }
-    // Half precision (settings relaxed_precision): while `relaxed` is set, float results (of type `relaxed_type`)
-    // are decorated RelaxedPrecision, which lets the driver compute them in 16 bits.
-    bool relaxed = false;
-    Id relaxed_type = 0;
-    uint32_t relaxed_count = 0;
-    void MaybeRelaxed(SpvOp op, Id type, Id id) {
-        if (!relaxed || type != relaxed_type || op == SpvOpBitcast || op == SpvOpLoad) return;
-        Decorate(id, SpvDecorationRelaxedPrecision, {});
-        relaxed_count++;
-    }
     Id OpResult(SpvOp op, Id type, std::initializer_list<uint32_t> args) {
         Id id = NewId();
         std::vector<uint32_t> w = {type, id};
         w.insert(w.end(), args.begin(), args.end());
         Emit(body_, op, w);
         MaybeExact(op, id);
-        MaybeRelaxed(op, type, id);
         return id;
     }
     Id OpResult(SpvOp op, Id type, const std::vector<uint32_t>& args) {
@@ -189,7 +178,6 @@ public:
         w.insert(w.end(), args.begin(), args.end());
         Emit(body_, op, w);
         MaybeExact(op, id);
-        MaybeRelaxed(op, type, id);
         return id;
     }
     Id Glsl(Id type, GLSLstd450Shim op, std::initializer_list<Id> args) {
@@ -197,7 +185,6 @@ public:
         std::vector<uint32_t> w = {type, id, ImportGlsl(), uint32_t(op)};
         w.insert(w.end(), args.begin(), args.end());
         Emit(body_, SpvOpExtInst, w);
-        MaybeRelaxed(SpvOpExtInst, type, id);
         return id;
     }
 

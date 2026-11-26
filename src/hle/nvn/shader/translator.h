@@ -40,10 +40,6 @@ struct TranslateOptions {
     // a fragment shader is not tested correctly by Adreno's hardware.
     int depth_test_func = 0;
     bool debug_outputs = false;
-    // Half precision (fragment shaders): float arithmetic whose result only feeds other such arithmetic and the
-    // colour outputs is decorated RelaxedPrecision; anything that reaches a texture coordinate, a comparison, a
-    // conversion, a memory address or the depth output stays 32-bit.
-    bool relaxed_precision = false;
     uint32_t debug_slot = 2;
 };                                    // block offset 0 (fragment stage)
 
@@ -62,7 +58,6 @@ struct ShaderInfo {
     uint32_t flat_mask = 0;             // varyings read with constant (flat) interpolation
     uint32_t output_mask = 0;           // varyings written (vertex) or render targets written (fragment)
     bool writes_depth = false;
-    uint32_t relaxed_ops = 0, float_ops = 0;  // relaxed_precision: float instructions made 16-bit / all of them
     bool uses_discard = false;
     bool writes_point_size = false;
     bool uses_primitive_id = false;     // fragment shader reads gl_PrimitiveID (needs geometryShader)

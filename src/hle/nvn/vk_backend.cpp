@@ -4901,12 +4901,10 @@ private:
     // ======================================================================================================
     // shaders, layouts, pipelines
     // ======================================================================================================
-    uint64_t relaxed_ops_ = 0, relaxed_float_ops_ = 0, relaxed_shaders_ = 0;
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
                                    uint32_t(opt.alpha_func) | (opt.debug_outputs ? 0x100u : 0u) |
-                                       (opt.relaxed_precision ? 0x200u : 0u) |
                                        (uint32_t(opt.depth_test_func) << 12)};  // the depth test variant is its own shader
         Key64 fk;
         fk.Add(parts, sizeof(parts));
@@ -4935,14 +4933,6 @@ private:
         }
         s.info = r.info;
         s.ok = true;
-        if (opt.relaxed_precision && r.info.stage == shader::Stage::Fragment) {
-            relaxed_ops_ += r.info.relaxed_ops;
-            relaxed_float_ops_ += r.info.float_ops;
-            if (++relaxed_shaders_ % 200 == 0 || relaxed_shaders_ == 20)
-                LOGI(kTag, "relaxed_precision: %llu of %llu float instructions 16-bit in %llu fragment shaders",
-                     (unsigned long long)relaxed_ops_, (unsigned long long)relaxed_float_ops_,
-                     (unsigned long long)relaxed_shaders_);
-        }
         if (++shaders_translated_ <= 8 || shaders_translated_ % 100 == 0)
             LOGI(kTag, "translated %s shader %016llx (%u instructions); %d so far",
                  r.info.stage == shader::Stage::Vertex ? "vertex" : "pixel", (unsigned long long)code.hash,
@@ -5296,7 +5286,6 @@ private:
             if (vf.is_signed) vopt.signed_attrib_mask |= 1u << i;
         }
         fopt.alpha_func = st_.color.alpha_func;
-        fopt.relaxed_precision = dsr::GetRuntime().config.relaxed_precision;
         // `hole_test` 1024 (square holes): the smoke / fog / glow fragment shaders show what they computed (see
         // TranslateOptions::debug_outputs), drawn without blending, depth test or the 3 empty targets.
         const bool debug_fx = (dsr::GetRuntime().config.hole_test & 1024) && st_.program[1] &&
