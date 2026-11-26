@@ -231,6 +231,33 @@ void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
     LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
 }
 
+// The engine's screen size block (1.0.0 main+0x1aeba90, 0x200 past GameBuild::shadow_size in every build):
+// int width, height; float width, height; int half width, half height; float half width, half height, with
+// the defaults 1280x720 / 640x360. The renderer fills it from the resolution getters when it starts
+// (main+0x101d80), but a static initializer (main+0x3751c4) copies the half size into two globals before that,
+// and the projected-decal pass sizes its colour target (main+0x3611c8) and its 1/size constants (main+0x36e9b4)
+// from those copies. Below a 1280x720 render (render scale, performance mode) the target stayed 640x360 beside
+// the game's own half-size depth (e.g. 484x272): decals were drawn into its top-left part only and showed in a
+// rectangle at the top left of the screen. The defaults are set to the render size before the game starts.
+static void ApplyScreenSizeDefaults(Runtime& rt, const GameBuild& b, int width, int height) {
+    struct ScreenSize {
+        int32_t w, h;
+        float fw, fh;
+        int32_t hw, hh;
+        float fhw, fhh;
+    };
+    auto* s = reinterpret_cast<ScreenSize*>(rt.main.base() + b.shadow_size + 0x200);
+    if (!rt.main.Contains(reinterpret_cast<uintptr_t>(s)) ||
+        !rt.main.Contains(reinterpret_cast<uintptr_t>(s) + sizeof(ScreenSize) - 1) || s->w != 1280 || s->h != 720 ||
+        s->fw != 1280.0f || s->fh != 720.0f || s->hw != 640 || s->hh != 360 || s->fhw != 640.0f || s->fhh != 360.0f) {
+        LOGW("hooks", "screen size defaults not found: decals may show in part of the screen below 1280x720");
+        return;
+    }
+    const int hw = width / 2, hh = height / 2;  // as the engine computes them (float * 0.5, truncated)
+    *s = {width, height, float(width), float(height), hw, hh, float(hw), float(hh)};
+    LOGI("hooks", "screen size defaults: %dx%d, half %dx%d (decal target)", width, height, hw, hh);
+}
+
 // Shadow quality (settings shadow_quality 0-2; from pull request #47): the shadow map size global the engine sizes its
 // shadow target from (see GameBuild::shadow_size) at 512 (0 and 1) or 1024 (2). With 0 the renderer also leaves the
 // shadow pass out and answers every lookup "lit" (vk_backend.cpp), so the small map only saves memory.
@@ -703,7 +730,8 @@ void InstallGameHooks() {
     // Render scale (settings render_scale, 0.5 - 1.0): the same resolution settings at a lower size, height and
     // width together (the height also has a getter with its own default, main+0x6a193c: main+0x6a1968 mov w2, #720).
     // The game draws less and the frame is enlarged to the screen at the end. Heights stay at or below 720 (the
-    // fixed half- and quarter-size buffers are then larger than needed, which is harmless).
+    // fixed half- and quarter-size buffers are then larger than needed). One half-size target is sized from the
+    // engine's screen size defaults instead (ApplyScreenSizeDefaults), which follow the render size.
     if (!rt.config.docked) {
         float ar = 16.0f / 9.0f;
         bool ar_ok = true;
@@ -741,6 +769,7 @@ void InstallGameHooks() {
                 g_aspect = float(width) / float(height);
                 rt.config.render_width = width;
                 rt.config.render_height = height;
+                ApplyScreenSizeDefaults(rt, b, width, height);
                 if (std::fabs(g_aspect - 16.0f / 9.0f) > 0.01f) std::thread(CameraAspectThread).detach();
             } else {
                 LOGW("hooks", "resolution patch failed: %s", err.c_str());
