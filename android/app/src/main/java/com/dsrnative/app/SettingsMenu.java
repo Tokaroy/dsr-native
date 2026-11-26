@@ -341,7 +341,7 @@ public final class SettingsMenu {
             "tab_language"};
     private static final int TAB_GRAPHICS = 2, TAB_TOUCH = 3, TAB_CHEATS = 4, TAB_LANGUAGE = 5;
     private final TextView[] mTabs = new TextView[TAB_KEYS.length];
-    private TextView mHint, mClose, mScaleLabel;
+    private TextView mHint, mClose, mQuit, mScaleLabel;
     private int mTab = 0;
     private boolean mEditingLayout;
     private Map<String, String> mValues = new HashMap<>();
@@ -382,6 +382,8 @@ public final class SettingsMenu {
             final int t = i;
             mTabs[i] = chip("", true);
             mTabs[i].setOnClickListener(v -> showTab(t));
+            narrow(mTabs[i]);
+            ((LinearLayout.LayoutParams) mTabs[i].getLayoutParams()).leftMargin = dp(6);
             tabs.addView(mTabs[i]);
         }
         tabScroll.addView(tabs, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -393,8 +395,17 @@ public final class SettingsMenu {
         mClose.setOnClickListener(v -> mDialog.dismiss());
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        clp.leftMargin = dp(18);
+        clp.leftMargin = dp(12);
         header.addView(mClose, clp);
+        // Quit: ends the game (TV boxes and controllers have no easy way to close the app). Asks first.
+        mQuit = chip("", true);
+        mQuit.setOnClickListener(v -> confirmExit());
+        narrow(mClose);
+        narrow(mQuit);
+        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        qlp.leftMargin = dp(8);
+        header.addView(mQuit, qlp);
         root.addView(header);
 
         mHint = text("", 12, DIM, false);
@@ -460,6 +471,7 @@ public final class SettingsMenu {
     private void relabel() {
         for (int i = 0; i < mTabs.length; i++) mTabs[i].setText(Strings.t(TAB_KEYS[i]));
         mClose.setText(Strings.t("close"));
+        mQuit.setText(Strings.t("quit"));
         mHint.setText(Strings.t("hint"));
     }
 
@@ -716,16 +728,6 @@ public final class SettingsMenu {
             mBody.addView(inst, ilp);
         }
         note(Strings.t("saved_in", sSettingsPath));
-
-        // Exit (TV boxes and controllers have no easy way to close the app); asks first, a stray press must not quit.
-        section(Strings.t("sec_exit"));
-        TextView exit = chip(Strings.t("exit_t"), false);
-        exit.setGravity(Gravity.CENTER);
-        exit.setOnClickListener(v -> confirmExit());
-        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        elp.topMargin = dp(8);
-        mBody.addView(exit, elp);
     }
 
     private void confirmExit() {
@@ -1629,6 +1631,11 @@ public final class SettingsMenu {
         g.setCornerRadius(dp(radiusDp));
         if (stroke != 0) g.setStroke(dp(1.5f), stroke);
         return g;
+    }
+
+    /** Header chips: less padding and spacing, so the tabs, Close and Quit fit in one row. */
+    private void narrow(TextView c) {
+        c.setPadding(dp(10), dp(8), dp(10), dp(8));
     }
 
     /** A focusable, clickable choice: gold when chosen, outlined when it has the controller's focus. */

@@ -1372,7 +1372,7 @@ final class Strings {
                 "화면 주사율 (실험적): 화면 주사율(%d Hz)만큼의 fps. 60fps를 넘으면 게임 물리가 이상해질 수 있습니다(사다리, 점프, 낙하, 일부 애니메이션).",
                 "屏幕刷新率 (实验性)：帧率与屏幕刷新率 (%d Hz) 相同。超过 60 FPS 时游戏物理可能出错（梯子、跳跃、坠落、部分动画）。",
                 "螢幕更新率 (實驗性)：幀率與螢幕更新率 (%d Hz) 相同。超過 60 FPS 時遊戲物理可能出錯（梯子、跳躍、墜落、部分動畫）。");
-        put("sec_exit", "Exit", "Quitter", "Beenden", "Esci", "Salir", "Sair", "Выход", "終了", "종료", "退出", "退出");
+        put("quit", "Quit", "Quitter", "Beenden", "Esci", "Salir", "Sair", "Выход", "終了", "종료", "退出", "結束");
         put("exit_t", "Exit game", "Quitter le jeu", "Spiel beenden", "Esci dal gioco", "Salir del juego", "Sair do jogo",
                 "Выйти из игры", "ゲームを終了", "게임 종료", "退出游戏", "結束遊戲");
         put("exit_q",
