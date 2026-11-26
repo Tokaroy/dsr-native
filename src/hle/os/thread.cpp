@@ -367,10 +367,11 @@ void PollerClockRead() {
     if (!t_current || !t_current->poller.load(std::memory_order_relaxed)) return;
     const int64_t now = NowTicks();
     if (!t_poller_run_start) t_poller_run_start = now;
-    if (now - t_poller_run_start < kTickFrequency / 2000) return;  // 0.5 ms
+    // 0.2 ms (it was 0.5 ms: still 0.8 s of CPU per 10 s on an AYN Thor, mostly reading the clock)
+    if (now - t_poller_run_start < kTickFrequency / 5000) return;
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
-        LOGI(kTag, "'%s' reads the clock without sleeping: it naps 5 ms after each 0.5 ms of running "
+        LOGI(kTag, "'%s' reads the clock without sleeping: it naps 5 ms after each 0.2 ms of running "
              "(offline network polling)", t_current->name.c_str());
     PollerSleep(0);  // lowers its priority once
     timespec ts{0, 5'000'000};

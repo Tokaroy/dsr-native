@@ -3659,14 +3659,29 @@ private:
                 dsr::platform::PreferFastCores("recorder thread");  // also restored if the system resets it
             else
                 KeepOffSlowCores();
+            // How long to wait awake for the next batch before sleeping: adapts to how often that wait pays off.
+            // A fixed 250 us wait caught few batches (they come every ~0.8 ms on average, an AYN Thor log: 12600
+            // batches per 10 s) and took ~1.5 s of CPU per 10 s, a third of it reading the clock.
+            int spin_us = 60, misses = 0;
             for (;;) {
-                // Batches arrive every few hundred microseconds while the render thread produces: wait for the
-                // next one awake for a moment, then sleep (it stays on the performance cores either way; spinning
-                // longer kept a core busy for nothing: ~6 s of CPU per 10 s).
-                const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(250);
-                for (int i = 0; rec_queued_.load(std::memory_order_acquire) == 0; i++) {
-                    if ((i & 255) == 255 && std::chrono::steady_clock::now() > spin_until) break;
-                    CpuRelax();
+                if (rec_queued_.load(std::memory_order_acquire) == 0) {
+                    const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+                    bool caught = false;
+                    for (int i = 1;; i++) {
+                        if (rec_queued_.load(std::memory_order_acquire) != 0) {
+                            caught = true;
+                            break;
+                        }
+                        if ((i & 1023) == 0 && std::chrono::steady_clock::now() > spin_until) break;
+                        CpuRelax();
+                    }
+                    if (caught) {
+                        misses = 0;
+                        spin_us = std::min(spin_us + 20, 200);
+                    } else if (++misses >= 4) {
+                        misses = 0;
+                        spin_us = std::max(spin_us / 2, 15);
+                    }
                 }
                 OpBatch* b;
                 {
