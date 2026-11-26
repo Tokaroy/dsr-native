@@ -1252,6 +1252,21 @@ final class Strings {
                 "ETC2나 ASTC로 변환한 텍스처를 DSRNative/cache에 저장해, 같은 지역을 다시 방문할 때 변환을 건너뜁니다(로딩 시 멈춤이 짧아짐). BC 텍스처를 지원하지 않는 GPU에서만 사용됩니다.",
                 "将转换为 ETC2 或 ASTC 的纹理保存到 DSRNative/cache，之后再次进入同一区域时跳过转换（加载时卡顿更短）。仅在不支持 BC 纹理的 GPU 上使用。",
                 "將轉換為 ETC2 或 ASTC 的紋理儲存到 DSRNative/cache，之後再次進入同一區域時略過轉換（載入時卡頓更短）。僅在不支援 BC 紋理的 GPU 上使用。");
+        put("half_t", "Half-precision shaders", "Shaders en demi-précision", "Shader mit halber Genauigkeit",
+                "Shader a mezza precisione", "Shaders de media precisión", "Shaders de meia precisão",
+                "Шейдеры половинной точности", "半精度シェーダー", "반정밀도 셰이더", "半精度着色器", "半精度著色器");
+        put("half_n",
+                "Lets colour calculations in pixel shaders run in 16 bits, which phone GPUs do about twice as fast. Texture positions, depth and comparisons stay full precision. May show banding in dark gradients.",
+                "Permet aux calculs de couleur des shaders de pixels de s'exécuter en 16 bits, ce que les GPU de téléphone font environ deux fois plus vite. Les positions de texture, la profondeur et les comparaisons restent en pleine précision. Peut provoquer des dégradés en bandes dans les zones sombres.",
+                "Lässt Farbberechnungen in Pixel-Shadern mit 16 Bit laufen, was Handy-GPUs etwa doppelt so schnell können. Texturpositionen, Tiefe und Vergleiche bleiben in voller Genauigkeit. Dunkle Verläufe können Stufen zeigen.",
+                "Fa eseguire i calcoli del colore negli shader dei pixel a 16 bit, che le GPU dei telefoni fanno circa due volte più velocemente. Posizioni delle texture, profondità e confronti restano a piena precisione. Può causare sfumature a bande nelle zone scure.",
+                "Permite que los cálculos de color de los shaders de píxeles se hagan en 16 bits, que las GPU de móvil hacen aproximadamente el doble de rápido. Las posiciones de textura, la profundidad y las comparaciones mantienen la precisión completa. Puede mostrar bandas en degradados oscuros.",
+                "Permite que os cálculos de cor dos shaders de pixel rodem em 16 bits, que as GPUs de celular fazem cerca de duas vezes mais rápido. Posições de textura, profundidade e comparações continuam em precisão total. Pode mostrar faixas em degradês escuros.",
+                "Позволяет выполнять расчёт цвета в пиксельных шейдерах в 16 битах — мобильные GPU делают это примерно вдвое быстрее. Координаты текстур, глубина и сравнения остаются полной точности. В тёмных градиентах возможны полосы.",
+                "ピクセルシェーダーの色の計算を 16 ビットで行えるようにします。スマホの GPU ではおよそ 2 倍速くなります。テクスチャ座標、深度、比較は完全な精度のままです。暗いグラデーションに縞が出ることがあります。",
+                "픽셀 셰이더의 색 계산을 16비트로 실행하도록 합니다. 휴대폰 GPU는 이를 약 두 배 빠르게 처리합니다. 텍스처 좌표, 깊이, 비교는 완전한 정밀도를 유지합니다. 어두운 그라데이션에 띠가 보일 수 있습니다.",
+                "让像素着色器中的颜色计算以 16 位运行，手机 GPU 处理这种运算大约快一倍。纹理坐标、深度和比较保持完整精度。暗部渐变可能出现色带。",
+                "讓像素著色器中的顏色計算以 16 位元執行，手機 GPU 處理這種運算大約快一倍。紋理座標、深度和比較保持完整精度。暗部漸層可能出現色帶。");
         put("geo_t",
                 "Geometry cache",
                 "Cache de géométrie",

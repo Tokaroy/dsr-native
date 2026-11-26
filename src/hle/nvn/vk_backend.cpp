@@ -4202,10 +4202,19 @@ private:
     // clears / copies
     // ======================================================================================================
     // Performs a deferred clear (outside a render pass).
-    void FlushClear(Image& img) {
+    void FlushClear(Image& img, int why = 0) {
         img.clear_pending = false;
-        img.clear_early = true;
+        // Predicts the next clear of this image: done early (EarlyClear) only if this one cost a pass. A clear done
+        // separately with no pass open costs nothing extra, and predicting from it made the prediction stick: the
+        // early clear was never a pass load again, even when it could have been.
+        if (why == 0) img.clear_early = rendering_;
         if (rendering_) clears_breaking_++;
+        {
+            char k[48];
+            snprintf(k, sizeof(k), "%ux%u fmt %d %s", img.width, img.height, img.nvn_format,
+                     why ? "early" : rendering_ ? "ended a pass" : "no pass open");
+            separate_clears_[k]++;
+        }
         EndRendering();
         const VkImageLayout dst = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         if (img.layout != dst) {
@@ -4229,14 +4238,11 @@ private:
     // command was already issued, and nothing used the image since.
     std::vector<std::pair<uint64_t, uint64_t>> early_clears_;  // image address, serial
     uint64_t clears_early_ = 0, clears_breaking_ = 0;
+    // Queued, not done now: at the next pass boundary it is skipped if that pass draws into the image (its clear
+    // becomes the load, and the prediction ends).
     void EarlyClear(Image* img) {
         if (!img->clear_early || capture_active_) return;
-        if (!rendering_) {
-            FlushClear(*img);
-            clears_early_++;
-        } else if (early_clears_.size() < 64) {
-            early_clears_.push_back({img->addr, img->serial});
-        }
+        if (early_clears_.size() < 64) early_clears_.push_back({img->addr, img->serial});
     }
     // At a pass boundary (no pass open): the clears EarlyClear queued, except for the images the next pass draws
     // into (`skip`: their clear becomes its load).
@@ -4247,11 +4253,12 @@ private:
             if (it == images_.end() || it->second.serial != serial || !it->second.clear_pending) continue;
             Image& img = it->second;
             if (&img == depth || (colors && std::find(colors->begin(), colors->end(), &img) != colors->end())) continue;
-            FlushClear(img);
+            FlushClear(img, 1);
             clears_early_++;
         }
         early_clears_.clear();
     }
+    std::map<std::string, uint64_t> separate_clears_;  // clears not done as a pass load, by image and why (log)
     uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, lrz_touches_ = 0,
              shader_depth_draws_ = 0;
     // The render pass currently open: its colour images (and subresources) and depth image.
@@ -4894,10 +4901,12 @@ private:
     // ======================================================================================================
     // shaders, layouts, pipelines
     // ======================================================================================================
+    uint64_t relaxed_ops_ = 0, relaxed_float_ops_ = 0, relaxed_shaders_ = 0;
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
                                    uint32_t(opt.alpha_func) | (opt.debug_outputs ? 0x100u : 0u) |
+                                       (opt.relaxed_precision ? 0x200u : 0u) |
                                        (uint32_t(opt.depth_test_func) << 12)};  // the depth test variant is its own shader
         Key64 fk;
         fk.Add(parts, sizeof(parts));
@@ -4926,6 +4935,14 @@ private:
         }
         s.info = r.info;
         s.ok = true;
+        if (opt.relaxed_precision && r.info.stage == shader::Stage::Fragment) {
+            relaxed_ops_ += r.info.relaxed_ops;
+            relaxed_float_ops_ += r.info.float_ops;
+            if (++relaxed_shaders_ % 200 == 0 || relaxed_shaders_ == 20)
+                LOGI(kTag, "relaxed_precision: %llu of %llu float instructions 16-bit in %llu fragment shaders",
+                     (unsigned long long)relaxed_ops_, (unsigned long long)relaxed_float_ops_,
+                     (unsigned long long)relaxed_shaders_);
+        }
         if (++shaders_translated_ <= 8 || shaders_translated_ % 100 == 0)
             LOGI(kTag, "translated %s shader %016llx (%u instructions); %d so far",
                  r.info.stage == shader::Stage::Vertex ? "vertex" : "pixel", (unsigned long long)code.hash,
@@ -5279,6 +5296,7 @@ private:
             if (vf.is_signed) vopt.signed_attrib_mask |= 1u << i;
         }
         fopt.alpha_func = st_.color.alpha_func;
+        fopt.relaxed_precision = dsr::GetRuntime().config.relaxed_precision;
         // `hole_test` 1024 (square holes): the smoke / fog / glow fragment shaders show what they computed (see
         // TranslateOptions::debug_outputs), drawn without blending, depth test or the 3 empty targets.
         const bool debug_fx = (dsr::GetRuntime().config.hole_test & 1024) && st_.program[1] &&
@@ -7489,6 +7507,15 @@ private:
             LOGI(kTag, "separate clears: %llu done early at a pass boundary, %llu still ended an open pass",
                  (unsigned long long)clears_early_, (unsigned long long)clears_breaking_);
         clears_early_ = clears_breaking_ = 0;
+        if (!separate_clears_.empty()) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (auto& [k, n] : separate_clears_) v.push_back({n, k});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 8; i++) top += " " + v[i].second + ": " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "separate clears by image:%s", top.c_str());
+            separate_clears_.clear();
+        }
         if (!resumed_passes_.empty()) {
             std::vector<std::pair<uint64_t, int>> v;
             for (auto& [line, n] : resumed_passes_) v.push_back({n, line});

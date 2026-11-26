@@ -466,6 +466,18 @@ static void TestShaderTranslator() {
     CHECK(f.ok && f.info.texture_dim[0] == TexDim::D2 && f.info.cbuf_mask == 0);  // the handle needs no buffer
     CHECK(f.ok && f.info.input_mask == 0x3);
 
+    // Half precision: only the colour multiply (R0 = texel * colour, written to the output) may be 16-bit; the
+    // reciprocal of w and the two multiplies making the texture coordinates must stay 32-bit.
+    TranslateOptions ro;
+    ro.relaxed_precision = true;
+    TranslateResult fr = Translate(fs.data(), fs.size(), ro);
+    CHECK(fr.ok && fr.info.float_ops == 4 && fr.info.relaxed_ops == 1);
+    size_t relaxed_decorations = 0;
+    for (size_t k = 5; k + 2 < fr.spirv.size(); k++)
+        if (fr.spirv[k] == ((3u << 16) | 71u) && fr.spirv[k + 2] == 0u) relaxed_decorations++;  // OpDecorate .. RelaxedPrecision
+    CHECK(relaxed_decorations >= 1);
+    CHECK(f.ok && f.info.relaxed_ops == 0);
+
     // A texture handle that does not come from the binding table is reported, not guessed.
     auto bad = MakeShader(5, 0xF, {Ipa(4, 0x80, 0, 255), TexB(0, 4, 4, 2, 0xF), kExit});
     CHECK(!Translate(bad.data(), bad.size(), TranslateOptions{}).ok);

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 
 #include "hle/nvn/shader/spirv_builder.h"
 
@@ -186,6 +187,7 @@ public:
         // dying characters vanished). Hence no driver-chosen fusing here, and an invariant gl_Position.
         b_.exact_float = stage_ == Stage::Vertex;
         Setup();
+        if (stage_ == Stage::Fragment && opt_.relaxed_precision) FindRelaxed();
         if (stage_ == Stage::Fragment && opt_.depth_test_func) EmitDepthTest();
         const size_t count = (size_ - kCodeOffset) / 8;
         bool ended = false;
@@ -221,6 +223,7 @@ public:
             b_.ExecutionMode(main_, SpvExecutionModeOriginUpperLeft);
             if (info_.writes_depth) b_.ExecutionMode(main_, SpvExecutionModeDepthReplacing);
         }
+        info_.relaxed_ops = uint32_t(relaxed_pcs_.size());
         r.spirv = b_.Finish(main_, first_label_);
         r.info = info_;
         r.ok = true;
@@ -249,6 +252,7 @@ private:
         t_void_ = b_.TypeVoid();
         t_bool_ = b_.TypeBool();
         t_f32_ = b_.TypeFloat();
+        b_.relaxed_type = t_f32_;
         t_u32_ = b_.TypeUint();
         t_i32_ = b_.TypeInt();
         t_v4f_ = b_.TypeVector(t_f32_, 4);
@@ -1309,7 +1313,11 @@ private:
                 b_.Op(SpvOpKill, {});
                 terminated = true;
                 break;
-            default: EmitOp(i, d); break;
+            default:
+                b_.relaxed = !relaxed_pcs_.empty() && relaxed_pcs_.count(pc_);
+                EmitOp(i, d);
+                b_.relaxed = false;
+                break;
         }
         if (predicated) {
             if (!terminated) b_.Op(SpvOpBranch, {merge});
@@ -1317,6 +1325,81 @@ private:
             predicated_ = false;
         }
         return false;
+    }
+
+    // ---- half precision (TranslateOptions::relaxed_precision) ---------------------------------------------------
+    static bool IsFloatAlu(Op op) {
+        return op == Op::FADD || op == Op::FADD32I || op == Op::FFMA || op == Op::FFMA32I || op == Op::FMUL ||
+               op == Op::FMUL32I || op == Op::FMNMX || op == Op::MUFU;
+    }
+    // Which float instructions may be 16-bit: those whose result is only read by float instructions that may be
+    // 16-bit themselves, or reaches the colour outputs. Shaders have no loops (translation refuses them), so a
+    // value's readers all come later in program order: one backward pass decides every instruction. Readers are
+    // over-approximated (every register field an instruction may read counts, and only a few kinds of write end
+    // a value's life), which can only keep more instructions 32-bit.
+    void FindRelaxed() {
+        uint32_t omap2;
+        memcpy(&omap2, code_ + kSphOffset + 19 * 4, 4);
+        if (omap2 & 2) return;  // writes the depth: the whole shader stays 32-bit
+        struct Ins {
+            uint32_t pc;
+            bool falu, predicated;
+            int write;                 // register whose value this ends (unpredicated single-register writes), or -1
+            int dest;                  // float ALU: its result register
+            std::vector<uint8_t> reads;
+        };
+        std::vector<Ins> ins;
+        const size_t count = (size_ - kCodeOffset) / 8;
+        for (size_t idx = 0; idx < count; idx++) {
+            if (idx % 4 == 0) continue;
+            uint64_t i;
+            memcpy(&i, code_ + kCodeOffset + idx * 8, 8);
+            const Decoded d = Patterns().Decode(i);
+            const uint32_t guard = uint32_t(Bits(i, 16, 4));
+            Ins x;
+            x.pc = uint32_t(idx * 8);
+            x.predicated = (guard & 7) != 7 || (guard & 8);
+            x.falu = IsFloatAlu(d.op);
+            x.dest = int(Bits(i, 0, 8));
+            const uint8_t ra = uint8_t(Bits(i, 8, 8)), rb = uint8_t(Bits(i, 20, 8)), rc = uint8_t(Bits(i, 39, 8));
+            const bool no_regs = d.op == Op::EXIT || d.op == Op::KIL || d.op == Op::BRA || d.op == Op::SSY ||
+                                 d.op == Op::SYNC || d.op == Op::NOP || d.op == Op::DEPBAR || d.op == Op::MEMBAR ||
+                                 d.op == Op::BAR || d.op == Op::PBK || d.op == Op::BRK || d.op == Op::PCNT ||
+                                 d.op == Op::CONT;
+            if (!no_regs) x.reads = {ra, rb, rc};
+            if (d.op == Op::FFMA32I) x.reads.push_back(uint8_t(x.dest));  // the addend is the destination
+            const bool tex = d.op == Op::TEX || d.op == Op::TEXS || d.op == Op::TEXB || d.op == Op::TLD ||
+                             d.op == Op::TLDB || d.op == Op::TLD4 || d.op == Op::TLD4B || d.op == Op::TLDS;
+            if (tex)
+                for (int k = 1; k < 4; k++) {
+                    x.reads.push_back(uint8_t(ra + k));
+                    x.reads.push_back(uint8_t(rb + k));
+                }
+            const bool single_write = x.falu || d.op == Op::MOV || d.op == Op::MOV32I || d.op == Op::IPA ||
+                                      d.op == Op::F2F || d.op == Op::I2F;
+            x.write = single_write && !x.predicated ? x.dest : -1;
+            if (d.op == Op::EXIT && !x.predicated) {
+                ins.push_back(x);
+                break;
+            }
+            ins.push_back(x);
+        }
+        std::vector<char> relaxed(ins.size(), 0);
+        for (size_t k = ins.size(); k-- > 0;) {
+            const Ins& x = ins[k];
+            info_.float_ops += x.falu;
+            if (!x.falu || x.dest == 255) continue;
+            bool ok = true;
+            for (size_t j = k + 1; j < ins.size() && ok; j++) {
+                const Ins& y = ins[j];
+                if (std::find(y.reads.begin(), y.reads.end(), uint8_t(x.dest)) != y.reads.end() &&
+                    !(y.falu && relaxed[j]))
+                    ok = false;
+                if (y.write == x.dest) break;
+            }
+            relaxed[k] = ok;
+            if (ok) relaxed_pcs_.insert(x.pc);
+        }
     }
 
     void EmitOp(uint64_t i, Decoded d) {
@@ -1714,6 +1797,7 @@ private:
     std::string error_;
     uint32_t pc_ = 0;
     bool predicated_ = false;
+    std::set<uint32_t> relaxed_pcs_;  // FindRelaxed: float instructions (by pc) computed in 16 bits
 
     spv::Builder b_;
     Id main_ = 0, first_label_ = 0;
