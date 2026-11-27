@@ -540,12 +540,34 @@ public class GameActivity extends NativeActivity {
         requestStorageAccess();
         Window w = getWindow();
         w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // settings.txt ui_gpu = 1: this window (and the touch controls, fps counter and settings menu on it) hardware
+        // accelerated again, as before the manifest turned it off: a test for the swipe camera judder on a Thor.
+        if (uiGpuSetting()) {
+            w.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED);
+            android.util.Log.i("DSRNative", "ui_gpu = 1: Android's views drawn with OpenGL");
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             WindowManager.LayoutParams lp = w.getAttributes();
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             w.setAttributes(lp);
         }
         hideSystemBars();
+    }
+
+    private static boolean uiGpuSetting() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "DSRNative/settings.txt")))) {
+            for (String line; (line = r.readLine()) != null;) {
+                String t = line.trim();
+                if (t.startsWith("ui_gpu")) {
+                    int eq = t.indexOf('=');
+                    return eq > 0 && t.substring(eq + 1).trim().startsWith("1");
+                }
+            }
+        } catch (Exception e) {
+            // no settings yet, or no storage access yet
+        }
+        return false;
     }
 
     @Override
