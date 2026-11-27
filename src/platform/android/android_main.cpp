@@ -1036,6 +1036,14 @@ void JNICALL TouchNativeVisible(JNIEnv*, jclass, jboolean visible) {
     }
     LOGI(kTag, "touch controls %s", visible ? "shown" : "hidden");
 }
+// A line from the touch overlay for our log (diagnostics: multi-touch).
+void JNICALL TouchNativeLog(JNIEnv* env, jclass, jstring text) {
+    if (!text) return;
+    const char* s = env->GetStringUTFChars(text, nullptr);
+    if (!s) return;
+    LOGI("touch", "%s", s);
+    env->ReleaseStringUTFChars(text, s);
+}
 jclass g_touch_cls = nullptr;  // global ref
 JNIEnv* g_glue_env = nullptr;  // the app glue thread's JNI environment (attached once, for the whole run)
 
@@ -1069,8 +1077,9 @@ void StartTouchControls(android_app* app) {
     const JNINativeMethod methods[] = {
         {const_cast<char*>("nativeState"), const_cast<char*>("(IFFFF)V"), reinterpret_cast<void*>(&TouchNativeState)},
         {const_cast<char*>("nativeVisible"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&TouchNativeVisible)},
+        {const_cast<char*>("nativeLog"), const_cast<char*>("(Ljava/lang/String;)V"), reinterpret_cast<void*>(&TouchNativeLog)},
     };
-    if (env->RegisterNatives(cls, methods, 2) != JNI_OK || env->ExceptionCheck()) {
+    if (env->RegisterNatives(cls, methods, 3) != JNI_OK || env->ExceptionCheck()) {
         env->ExceptionClear();
         LOGW(kTag, "touch controls: could not register natives");
         return;

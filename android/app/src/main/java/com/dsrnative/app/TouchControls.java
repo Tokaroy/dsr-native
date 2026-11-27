@@ -46,6 +46,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
 
     static native void nativeState(int buttons, float lx, float ly, float rx, float ry);
     static native void nativeVisible(boolean visible);
+    static native void nativeLog(String text);  // a line for our log (diagnostics)
 
     private static TouchControls sView;
     /** settings.txt touch_camera_recenter: a thumb resting on the camera stick brings it back to the centre. */
@@ -981,6 +982,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
                 down(e.getPointerId(i), e.getX(i), e.getY(i));
+                logTouch(e, i, "down");
                 break;
             }
             case MotionEvent.ACTION_MOVE:
@@ -989,18 +991,74 @@ public final class TouchControls extends View implements InputManager.InputDevic
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP: {
                 int i = e.getActionIndex();
+                logTouch(e, i, "up");
                 up(e.getPointerId(i));
                 break;
             }
             case MotionEvent.ACTION_CANCEL:
+                logTouch(e, -1, "cancel");
                 releaseAll();
                 break;
             default:
                 break;
         }
         sendState();
+        logButtons();
         invalidate();
         return true;
+    }
+
+    // ---- diagnostics: multi-touch (an OPPO tablet could not hold two buttons at once) -----------------------------
+    // Each finger down / up with what it landed on and how many fingers Android reports, touches Android cancelled
+    // (the whole gesture, or one finger: FLAG_CANCELED), and every change of the buttons held. The first 400 lines.
+    private int mTouchLogs = 0, mLoggedBits = 0;
+
+    private static void touchLog(String text) {
+        try {
+            nativeLog(text);
+        } catch (UnsatisfiedLinkError err) {
+            android.util.Log.i("DSRNative", "touch: " + text);
+        }
+    }
+
+    private String targetOf(int id) {
+        if (id < 0 || id >= 16) return "?";
+        switch (mKind[id]) {
+            case K_BUTTON: return mOn[id] != null ? "button " + mOn[id].label : "button (slid off)";
+            case K_STICK: return "move stick";
+            case K_RSTICK: return sSwipe ? "camera (swipe)" : "camera stick";
+            default: return "nothing";
+        }
+    }
+
+    private void logTouch(MotionEvent e, int i, String what) {
+        if (mTouchLogs >= 400) return;
+        mTouchLogs++;
+        if (i < 0) {
+            touchLog("Android cancelled the touches (" + e.getPointerCount()
+                    + " fingers were down): everything released");
+            return;
+        }
+        int id = e.getPointerId(i);
+        boolean cancelled = android.os.Build.VERSION.SDK_INT >= 33 && (e.getFlags() & 0x20) != 0;  // FLAG_CANCELED
+        touchLog(String.format(java.util.Locale.ROOT,
+                "finger %d %s at %.0f%%, %.0f%% of the screen: %s; Android reports %d finger(s) down%s", id, what,
+                100f * e.getX(i) / Math.max(1, getWidth()), 100f * e.getY(i) / Math.max(1, getHeight()), targetOf(id),
+                e.getPointerCount() - ("up".equals(what) ? 1 : 0), cancelled ? " (Android cancelled this finger)" : ""));
+    }
+
+    private void logButtons() {
+        int bits = 0;
+        StringBuilder sb = new StringBuilder();
+        for (Button b : mButtons)
+            if (b.pressCount > 0) {
+                if ((bits & b.bit) == 0) sb.append(sb.length() > 0 ? " + " : "").append(b.label);
+                bits |= b.bit;
+            }
+        if (bits == mLoggedBits || mTouchLogs >= 400) return;
+        mLoggedBits = bits;
+        mTouchLogs++;
+        touchLog("buttons held: " + (sb.length() > 0 ? sb : "none"));
     }
 
     // ---- swipe in from the left edge: opens the settings menu ------------------------------------------------------
