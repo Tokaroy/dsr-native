@@ -2,6 +2,17 @@
 // Copyright (C) 2024 Advanced Micro Devices, Inc. See third_party/fsr1/LICENSE.txt. Only the types and helper
 // functions the two filters use are defined here (the approximate reciprocals are exact ones).
 #version 450
+// Half precision (the default build): colours, luma, weights and directions are mediump, which glslc marks
+// RelaxedPrecision so GPUs with fast 16-bit maths (Mali, Adreno: twice the rate, half the registers) use it, as
+// AMD's FP16 path does. Positions and texture coordinates stay highp (at 1272 pixels a 16-bit coordinate is off by
+// part of a pixel). No device feature is needed: a driver may ignore the decoration and run it at 32 bits.
+// Built a second time with -DFSR_FULL_PRECISION (settings.txt fsr_half = 0).
+#ifndef FSR_FULL_PRECISION
+precision mediump float;
+#define FSR_SAMPLER mediump sampler2D
+#else
+#define FSR_SAMPLER sampler2D
+#endif
 #define FfxFloat32 float
 #define FfxFloat32x2 vec2
 #define FfxFloat32x3 vec3
@@ -28,12 +39,12 @@
 #define ffxBroadcast3(x) vec3(x)
 #define ffxBroadcast4(x) vec4(x)
 
-layout(set = 0, binding = 0) uniform sampler2D uTex;
+layout(set = 0, binding = 0) uniform FSR_SAMPLER uTex;
 layout(push_constant) uniform PC { uvec4 con0; uvec4 con1; uvec4 con2; uvec4 con3; } pc;
 layout(location = 0) out vec4 outColor;
-vec4 FsrEasuRF(vec2 p) { return textureGather(uTex, p, 0); }
-vec4 FsrEasuGF(vec2 p) { return textureGather(uTex, p, 1); }
-vec4 FsrEasuBF(vec2 p) { return textureGather(uTex, p, 2); }
+vec4 FsrEasuRF(highp vec2 p) { return textureGather(uTex, p, 0); }
+vec4 FsrEasuGF(highp vec2 p) { return textureGather(uTex, p, 1); }
+vec4 FsrEasuBF(highp vec2 p) { return textureGather(uTex, p, 2); }
 // Filtering for a given tap for the scalar.
 void fsrEasuTapFloat(
     FFX_PARAMETER_INOUT FfxFloat32x3 accumulatedColor,   // Accumulated color, with negative lobe.
@@ -153,8 +164,8 @@ void ffxFsrEasuFloat(
     FFX_PARAMETER_IN FfxUInt32x4 con3)
 {
     // Get position of 'f'.
-    FfxFloat32x2 pp = FfxFloat32x2(ip) * ffxAsFloat(con0.xy) + ffxAsFloat(con0.zw);
-    FfxFloat32x2 fp = floor(pp);
+    highp vec2 pp = FfxFloat32x2(ip) * ffxAsFloat(con0.xy) + ffxAsFloat(con0.zw);
+    highp vec2 fp = floor(pp);
     pp -= fp;
 
     // 12-tap kernel.
@@ -173,12 +184,13 @@ void ffxFsrEasuFloat(
     //    a b
     //    r g    <- unused (z)
     // Allowing dead-code removal to remove the 'z's.
-    FfxFloat32x2 p0 = fp * ffxAsFloat(con1.xy) + ffxAsFloat(con1.zw);
+    highp vec2 p0 = fp * ffxAsFloat(con1.xy) + ffxAsFloat(con1.zw);
 
     // These are from p0 to avoid pulling two constants on pre-Navi hardware.
-    FfxFloat32x2 p1    = p0 + ffxAsFloat(con2.xy);
-    FfxFloat32x2 p2    = p0 + ffxAsFloat(con2.zw);
-    FfxFloat32x2 p3    = p0 + ffxAsFloat(con3.xy);
+    highp vec2 p1     = p0 + ffxAsFloat(con2.xy);
+    highp vec2 p2     = p0 + ffxAsFloat(con2.zw);
+    highp vec2 p3     = p0 + ffxAsFloat(con3.xy);
+    vec2 ppf = pp;  // the fraction (0 to 1): fine in half precision
     FfxFloat32x4 bczzR = FsrEasuRF(p0);
     FfxFloat32x4 bczzG = FsrEasuGF(p0);
     FfxFloat32x4 bczzB = FsrEasuBF(p0);
@@ -215,10 +227,10 @@ void ffxFsrEasuFloat(
     // Accumulate for bilinear interpolation.
     FfxFloat32x2 dir = ffxBroadcast2(0.0);
     FfxFloat32  len = FfxFloat32(0.0);
-    fsrEasuSetFloat(dir, len, pp, FFX_TRUE,  FFX_FALSE, FFX_FALSE, FFX_FALSE, bL, eL, fL, gL, jL);
-    fsrEasuSetFloat(dir, len, pp, FFX_FALSE, FFX_TRUE,  FFX_FALSE, FFX_FALSE, cL, fL, gL, hL, kL);
-    fsrEasuSetFloat(dir, len, pp, FFX_FALSE, FFX_FALSE, FFX_TRUE,  FFX_FALSE, fL, iL, jL, kL, nL);
-    fsrEasuSetFloat(dir, len, pp, FFX_FALSE, FFX_FALSE, FFX_FALSE, FFX_TRUE,  gL, jL, kL, lL, oL);
+    fsrEasuSetFloat(dir, len, ppf, FFX_TRUE,  FFX_FALSE, FFX_FALSE, FFX_FALSE, bL, eL, fL, gL, jL);
+    fsrEasuSetFloat(dir, len, ppf, FFX_FALSE, FFX_TRUE,  FFX_FALSE, FFX_FALSE, cL, fL, gL, hL, kL);
+    fsrEasuSetFloat(dir, len, ppf, FFX_FALSE, FFX_FALSE, FFX_TRUE,  FFX_FALSE, fL, iL, jL, kL, nL);
+    fsrEasuSetFloat(dir, len, ppf, FFX_FALSE, FFX_FALSE, FFX_FALSE, FFX_TRUE,  gL, jL, kL, lL, oL);
 
     // Normalize with approximation, and cleanup close to zero.
     FfxFloat32x2 dir2 = dir * dir;
@@ -262,18 +274,18 @@ void ffxFsrEasuFloat(
     // Accumulation.
     FfxFloat32x3 aC = ffxBroadcast3(0.0);
     FfxFloat32  aW = FfxFloat32(0.0);
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, -1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(bczzR.x, bczzG.x, bczzB.x));  // b
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, -1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(bczzR.y, bczzG.y, bczzB.y));  // c
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(-1.0, 1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(ijfeR.x, ijfeG.x, ijfeB.x));  // i
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(ijfeR.y, ijfeG.y, ijfeB.y));   // j
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 0.0) - pp, dir, len2, lob, clp, FfxFloat32x3(ijfeR.z, ijfeG.z, ijfeB.z));   // f
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(-1.0, 0.0) - pp, dir, len2, lob, clp, FfxFloat32x3(ijfeR.w, ijfeG.w, ijfeB.w));  // e
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(klhgR.x, klhgG.x, klhgB.x));   // k
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(2.0, 1.0) - pp, dir, len2, lob, clp, FfxFloat32x3(klhgR.y, klhgG.y, klhgB.y));   // l
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(2.0, 0.0) - pp, dir, len2, lob, clp, FfxFloat32x3(klhgR.z, klhgG.z, klhgB.z));   // h
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 0.0) - pp, dir, len2, lob, clp, FfxFloat32x3(klhgR.w, klhgG.w, klhgB.w));   // g
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 2.0) - pp, dir, len2, lob, clp, FfxFloat32x3(zzonR.z, zzonG.z, zzonB.z));   // o
-    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 2.0) - pp, dir, len2, lob, clp, FfxFloat32x3(zzonR.w, zzonG.w, zzonB.w));   // n
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, -1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(bczzR.x, bczzG.x, bczzB.x));  // b
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, -1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(bczzR.y, bczzG.y, bczzB.y));  // c
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(-1.0, 1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(ijfeR.x, ijfeG.x, ijfeB.x));  // i
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(ijfeR.y, ijfeG.y, ijfeB.y));   // j
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 0.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(ijfeR.z, ijfeG.z, ijfeB.z));   // f
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(-1.0, 0.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(ijfeR.w, ijfeG.w, ijfeB.w));  // e
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(klhgR.x, klhgG.x, klhgB.x));   // k
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(2.0, 1.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(klhgR.y, klhgG.y, klhgB.y));   // l
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(2.0, 0.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(klhgR.z, klhgG.z, klhgB.z));   // h
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 0.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(klhgR.w, klhgG.w, klhgB.w));   // g
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(1.0, 2.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(zzonR.z, zzonG.z, zzonB.z));   // o
+    fsrEasuTapFloat(aC, aW, FfxFloat32x2(0.0, 2.0) - ppf, dir, len2, lob, clp, FfxFloat32x3(zzonR.w, zzonG.w, zzonB.w));   // n
 
     // Normalize and dering.
     pix = ffxMin(max4, max(min4, aC * ffxBroadcast3(ffxReciprocal(aW))));

@@ -2,6 +2,17 @@
 // Copyright (C) 2024 Advanced Micro Devices, Inc. See third_party/fsr1/LICENSE.txt. Only the types and helper
 // functions the two filters use are defined here (the approximate reciprocals are exact ones).
 #version 450
+// Half precision (the default build): colours, luma, weights and directions are mediump, which glslc marks
+// RelaxedPrecision so GPUs with fast 16-bit maths (Mali, Adreno: twice the rate, half the registers) use it, as
+// AMD's FP16 path does. Positions and texture coordinates stay highp (at 1272 pixels a 16-bit coordinate is off by
+// part of a pixel). No device feature is needed: a driver may ignore the decoration and run it at 32 bits.
+// Built a second time with -DFSR_FULL_PRECISION (settings.txt fsr_half = 0).
+#ifndef FSR_FULL_PRECISION
+precision mediump float;
+#define FSR_SAMPLER mediump sampler2D
+#else
+#define FSR_SAMPLER sampler2D
+#endif
 #define FfxFloat32 float
 #define FfxFloat32x2 vec2
 #define FfxFloat32x3 vec3
@@ -29,7 +40,7 @@
 #define ffxBroadcast4(x) vec4(x)
 
 #define FSR_RCAS_LIMIT (0.25 - (1.0 / 16.0))
-layout(set = 0, binding = 0) uniform sampler2D uTex;
+layout(set = 0, binding = 0) uniform FSR_SAMPLER uTex;
 layout(push_constant) uniform PC { uvec4 con; } pc;
 layout(location = 0) out vec4 outColor;
 vec4 FsrRcasLoadF(ivec2 p) { return texelFetch(uTex, clamp(p, ivec2(0), textureSize(uTex, 0) - ivec2(1)), 0); }

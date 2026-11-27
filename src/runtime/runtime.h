@@ -69,6 +69,9 @@ struct RuntimeConfig {
     // of the bilinear enlargement.
     int fxaa = 0;
     bool fsr = false;
+    // fsr_half: FSR 1 in half precision (colours and weights at 16 bits, positions at 32: up to twice as fast on
+    // Mali and Adreno); 0 = the full-precision shaders.
+    bool fsr_half = true;
     // shadow_quality: 0 = no shadows (the shadow map pass is not drawn, lookups say "lit"), 1 = 512, 2 = 1024,
     // 3 = the game's 2048 (1024 with performance_mode).
     int shadow_quality = 3;

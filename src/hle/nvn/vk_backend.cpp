@@ -8435,9 +8435,16 @@ private:
             return false;
         }
 #ifdef DSR_HAVE_FSR1
-        fsr_ready_ = module(kFsr1VertSpv, sizeof kFsr1VertSpv, &post_fsr_vs_) &&
-                     module(kFsr1EasuSpv, sizeof kFsr1EasuSpv, &post_fs_[kPostEasu]) &&
-                     module(kFsr1RcasSpv, sizeof kFsr1RcasSpv, &post_fs_[kPostRcas]);
+        {
+            const bool half = dsr::GetRuntime().config.fsr_half;
+            fsr_ready_ = module(kFsr1VertSpv, sizeof kFsr1VertSpv, &post_fsr_vs_) &&
+                         (half ? module(kFsr1EasuSpv, sizeof kFsr1EasuSpv, &post_fs_[kPostEasu])
+                               : module(kFsr1EasuFullSpv, sizeof kFsr1EasuFullSpv, &post_fs_[kPostEasu])) &&
+                         (half ? module(kFsr1RcasSpv, sizeof kFsr1RcasSpv, &post_fs_[kPostRcas])
+                               : module(kFsr1RcasFullSpv, sizeof kFsr1RcasFullSpv, &post_fs_[kPostRcas]));
+            if (fsr_ready_ && dsr::GetRuntime().config.fsr)
+                LOGI(kTag, "FSR 1 shaders: %s", half ? "half precision (fsr_half 1)" : "full precision (fsr_half 0)");
+        }
 #endif
         VkDescriptorSetLayoutBinding bind{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
                                           nullptr};
