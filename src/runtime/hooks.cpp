@@ -310,7 +310,49 @@ void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zon
     if ((*channel == 3 || *channel == 4) && *max >= 0.99f && *max < 4.0f) *max = 4.0f;
 }
 
+// The input layer's action setter (df37 main+0x82c900): each device channel that drives a user action passes its value
+// here; the action keeps its largest positive and its most negative value of the frame (+208, +248) and their sum
+// (+328), which is later copied to the array the game reads (+32). Replaced by the same code that logs, once per
+// action, its id and the first non-zero value: the right stick's action ids lead to the camera code that reads them.
+struct ActionSetHook {
+    const char* build_id;
+    uint64_t setter;
+};
+const ActionSetHook kActionSetHooks[] = {
+    {"5a797a3a", 0x8312d0},
+    {"df3766a2", 0x82c900},
+};
+void ActionSet(uint8_t* self, int id, float v) {
+    float* pos = *reinterpret_cast<float**>(self + 208);
+    float* neg = *reinterpret_cast<float**>(self + 248);
+    float* sum = *reinterpret_cast<float**>(self + 328);
+    float p = pos[id], n = neg[id];
+    if (v >= 0.0f) {
+        if (p < v) pos[id] = p = v;
+    } else if (n > v) {
+        neg[id] = n = v;
+    }
+    sum[id] = p + n;
+    static std::atomic<uint64_t> logged[2];
+    if (v != 0.0f && id >= 0 && id < 128 && !(logged[id >> 6].fetch_or(1ull << (id & 63)) & (1ull << (id & 63))))
+        LOGI("hooks", "input action %d: first value %.3f (input object @%p, read array @%p)", id, v,
+             static_cast<void*>(self), *reinterpret_cast<void**>(self + 32));
+}
+
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    for (const ActionSetHook& h : kActionSetHooks) {
+        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+        // ldr x9,[x0,#208] / ldr x10,[x0,#248] / sbfiz x11,x1,#2,#32
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.setter);
+        std::string err;
+        if (code[0] != 0xF9406809 || code[1] != 0xF9407C0A)
+            LOGW("hooks", "input action setter not found at main+0x%lx", (unsigned long)h.setter);
+        else if (rt.main.HookFunction(h.setter, reinterpret_cast<void*>(&ActionSet), &err))
+            LOGI("hooks", "input action probe: logging the actions the sticks drive");
+        else
+            LOGW("hooks", "input action hook failed: %s", err.c_str());
+    }
+
     for (const MapEntryHook& h : kMapEntryHooks) {
         if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
         // ldr x9,[x0,#8] / orr w10,wzr,#0x1c / smull x11,w1,w10 / ldr w9,[x9,x11]
