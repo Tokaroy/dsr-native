@@ -923,6 +923,7 @@ public:
 
     void Execute(const CmdList& cmds) override {
         std::lock_guard<std::mutex> lk(m_);
+        if (Lost()) return;  // RecoveringBackend restarts the renderer before the next list
         MsTimer timer(exec_ms_);
         const ListMarks marks = Marks();
         if (!EnsureDevice()) return;
@@ -1524,7 +1525,7 @@ public:
 
     void Present(const TexRef& tex) override {
         std::lock_guard<std::mutex> lk(m_);
-        if (!EnsureDevice()) return;
+        if (Lost() || !EnsureDevice()) return;
         ReportDraws();
         ProfCollect();
         occ_frame_++;
@@ -1587,6 +1588,293 @@ public:
         NextSlot();
         if (++presented_ == 1) LOGI(kTag, "first frame on screen");
         dsr::platform::CountFrameShown();
+        // settings test_gpu_lost: act as if the GPU had been lost, every that many seconds (tests the recovery).
+        if (const int every = dsr::GetRuntime().config.test_gpu_lost; every > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (presented_ == 1) test_lost_start_ = now;
+            else if (now - test_lost_start_ >= std::chrono::seconds(every) && !Lost()) {
+                LOGW(kTag, "test_gpu_lost: acting as if the GPU had been lost (%d s after this renderer's first frame)",
+                     every);
+                lost_.store(kLostTest, std::memory_order_release);
+            }
+        }
+    }
+
+    // ======================================================================================================
+    // GPU loss (VK_ERROR_DEVICE_LOST): the driver gave up on the device (a GPU fault or a job it killed), after
+    // which nothing submitted runs any more and the screen stops updating while the game goes on (sound plays). A
+    // Mali-G68 log: lost after 30 minutes of play, the frame froze for good. The renderer then restarts: this
+    // backend stops its threads, frees its GPU objects and its device (Abandon), and a new one (RecoveringBackend
+    // below) takes over from the next list, loading textures and geometry from game memory again. What only the GPU
+    // held (render targets) is lost: a frame or two may look wrong.
+    // ======================================================================================================
+    static constexpr int kLostDriver = 1, kLostHung = 2, kLostTest = 3;
+    bool Lost() const { return lost_.load(std::memory_order_acquire) != 0; }
+    int LostReason() const { return lost_.load(std::memory_order_acquire); }
+    bool InitFailed() {
+        std::lock_guard<std::mutex> lk(m_);
+        return init_failed_ && !device_;
+    }
+    // The bound state of the game's command stream (persists across command lists): carried to the new backend.
+    DrawState TakeState() {
+        std::lock_guard<std::mutex> lk(m_);
+        return st_;
+    }
+    void AdoptState(const DrawState& st) {
+        std::lock_guard<std::mutex> lk(m_);
+        st_ = st;
+    }
+    void SetGeneration(int g) { generation_ = g; }
+
+    // Stops this backend for good and gives back its GPU objects, device and window surface (render thread; the
+    // window can then take a new surface). Workers that might still be inside a driver call after a few seconds:
+    // nothing is destroyed (leaked rather than freed under a running call), only logged.
+    void Abandon() {
+        std::lock_guard<std::mutex> lk(m_);
+        const auto t0 = std::chrono::steady_clock::now();
+        const int reason = LostReason();
+        auto wait_for = [&](auto&& done, int ms) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+            for (int i = 0; !done(); i++) {
+                if (std::chrono::steady_clock::now() > until) return false;
+                if ((i & 255) == 255) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                else std::this_thread::yield();
+            }
+            return true;
+        };
+        bool idle = true;
+        // The recorder finishes what it was given (on a lost device the driver calls fail at once).
+        if (rec_started_) {
+            EmitPendingCopies();
+            Publish();
+            idle &= wait_for([&] {
+                return rec_queued_.load(std::memory_order_acquire) == 0 && !rec_busy_.load(std::memory_order_acquire);
+            }, 3000);
+        }
+        if (copy_started_) {
+            EmitPendingCopies();
+            idle &= wait_for([&] { return copy_batches_done_.load(std::memory_order_acquire) >= copy_batches_queued_; },
+                             2000);
+        }
+        // Pipeline compilers: queued jobs are dropped, running ones finish.
+        std::vector<std::shared_ptr<PipelineJob>> running;
+        {
+            std::lock_guard<std::mutex> clk(compile_mutex_);
+            std::unordered_set<PipelineJob*> queued;
+            for (auto& j : compile_queue_) queued.insert(j.get());
+            compile_queue_.clear();
+            for (auto& [h, e] : compiling_)
+                if (!queued.count(e.second.get())) running.push_back(e.second);
+        }
+        idle &= wait_for([&] {
+            for (auto& j : running)
+                if (!j->done.load(std::memory_order_acquire)) return false;
+            return true;
+        }, 5000);
+        idle &= wait_for([&] { return !cache_saving_.load(); }, 3000);
+        // Hashing workers (CPU only): no more jobs.
+        prehash_next_.store(kNoMoreJobs);
+        idle &= wait_for([&] { return prehash_active_.load() == 0; }, 2000);
+        // Every worker thread leaves its loop.
+        quit_.store(true, std::memory_order_release);
+        for (auto [mu, cv] : {std::pair{&rec_mutex_, &rec_cv_}, std::pair{&compile_mutex_, &compile_cv_},
+                              std::pair{&bg_mutex_, &bg_cv_}, std::pair{&prehash_mutex_, &prehash_cv_},
+                              std::pair{&copy_mutex_, &copy_cv_}}) {
+            std::lock_guard<std::mutex> wlk(*mu);
+            cv->notify_all();
+        }
+        {
+            std::lock_guard<std::mutex> blk(bg_mutex_);
+            bg_queue_.clear();
+            bg_done_.clear();
+        }
+        if (!device_) {
+            LOGI(kTag, "GPU recovery: renderer %d had no device", generation_);
+            return;
+        }
+        if (!idle) {
+            LOGW(kTag, "GPU recovery: renderer %d still had a worker inside the driver after a few seconds: its GPU "
+                       "objects are left as they are", generation_);
+            return;
+        }
+        // A test (the device works): let the GPU finish first, as after a real loss nothing runs any more.
+        if (reason == kLostTest) vkQueueWaitIdle(queue_);
+        // The game may wait for values its lists write (semaphores, counters): written now, from the CPU. What the
+        // GPU would have read back is not written (garbage after a loss).
+        for (Slot& sl : slots_) {
+            DeliverReadbacks(sl);
+            sl.pending = false;
+        }
+        const size_t freed = ReleaseGpu();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        LOGI(kTag, "GPU recovery: renderer %d stopped and freed (%zu MB of GPU images) in %.0f ms", generation_,
+             freed >> 20, ms);
+    }
+
+private:
+    std::atomic<int> lost_{0};
+    std::atomic<bool> quit_{false};  // Abandon: worker threads leave their loops
+    int generation_ = 1;             // renderers so far (1 + recoveries)
+    std::chrono::steady_clock::time_point test_lost_start_{};
+    // A Vulkan result that says the device is gone: noted (once logged), the backend is restarted at the next list.
+    void NoteLost(VkResult r, const char* where) {
+        if (r != VK_ERROR_DEVICE_LOST) return;
+        int expected = 0;
+        if (lost_.compare_exchange_strong(expected, kLostDriver))
+            LOGW(kTag, "the GPU device was lost (%s): the renderer will restart", where);
+    }
+    // Destroys every Vulkan object, the device, the surface and the instance (Abandon). Returns the bytes of image
+    // memory freed (an estimate from their sizes).
+    size_t ReleaseGpu() {
+        const VkDevice d = device_;
+        size_t bytes = 0;
+        auto kill_image = [&](Image& img) {
+            for (auto& [k, v] : img.views)
+                if (v) vkDestroyImageView(d, v, nullptr);
+            if (img.image) vkDestroyImage(d, img.image, nullptr);
+            if (img.memory) {
+                vkFreeMemory(d, img.memory, nullptr);
+                bytes += size_t(img.width) * size_t(img.height) * size_t(std::max(1, img.depth)) *
+                         size_t(std::max(1, img.layers)) * 4;
+            }
+            img = Image{};
+        };
+        if (swapchain_) vkDestroySwapchainKHR(d, swapchain_, nullptr);
+        swapchain_ = VK_NULL_HANDLE;
+        sc_images_.clear();
+        for (auto& [a, img] : images_) kill_image(img);
+        for (auto& [k, p] : parked_) kill_image(p.img);
+        for (auto& [k, e] : sharp_imgs_) kill_image(e.img);
+        kill_image(post_fxaa_img_);
+        kill_image(post_fsr_tmp_);
+        for (Retired& r : retired_) {
+            for (VkImageView v : r.views) vkDestroyImageView(d, v, nullptr);
+            if (r.image) vkDestroyImage(d, r.image, nullptr);
+            if (r.memory) vkFreeMemory(d, r.memory, nullptr);
+        }
+        for (CaptureItem& it : capture_items_) {
+            if (it.buffer) vkDestroyBuffer(d, it.buffer, nullptr);
+            if (it.memory) vkFreeMemory(d, it.memory, nullptr);
+            if (it.image) vkDestroyImage(d, it.image, nullptr);
+            if (it.image_memory) vkFreeMemory(d, it.image_memory, nullptr);
+        }
+        {
+            std::lock_guard<std::mutex> flk(fb_mutex_);
+            for (auto& [k, fb] : fb_cache_)
+                if (fb) vkDestroyFramebuffer(d, fb, nullptr);
+            fb_cache_.clear();
+        }
+        for (Slot& sl : slots_) {
+            for (VkFramebuffer fb : sl.framebuffers)
+                if (fb) vkDestroyFramebuffer(d, fb, nullptr);
+            for (VkDescriptorPool p : sl.extra_pools)
+                if (p) vkDestroyDescriptorPool(d, p, nullptr);
+            if (sl.pool) vkDestroyDescriptorPool(d, sl.pool, nullptr);
+            if (sl.fence) vkDestroyFence(d, sl.fence, nullptr);
+            if (sl.ts) vkDestroyQueryPool(d, sl.ts, nullptr);
+            if (sl.occ) vkDestroyQueryPool(d, sl.occ, nullptr);
+            if (sl.stream) vkDestroyBuffer(d, sl.stream, nullptr);
+            if (sl.mem) vkFreeMemory(d, sl.mem, nullptr);
+            sl.framebuffers.clear();
+            sl.extra_pools.clear();
+            sl.pool = VK_NULL_HANDLE;
+            sl.fence = VK_NULL_HANDLE;
+            sl.ts = sl.occ = VK_NULL_HANDLE;
+            sl.stream = VK_NULL_HANDLE;
+            sl.mem = VK_NULL_HANDLE;
+            sl.ptr = nullptr;
+            sl.readbacks.clear();
+        }
+        stream_ = VK_NULL_HANDLE;  // a slot's
+        stream_memory_ = VK_NULL_HANDLE;
+        stream_ptr_ = nullptr;
+        desc_pool_ = VK_NULL_HANDLE;
+        if (geo_buf_) vkDestroyBuffer(d, geo_buf_, nullptr);
+        if (geo_mem_) vkFreeMemory(d, geo_mem_, nullptr);
+        geo_buf_ = VK_NULL_HANDLE;
+        geo_mem_ = VK_NULL_HANDLE;
+        geo_ptr_ = nullptr;
+        if (pcheck_buf_) vkDestroyBuffer(d, pcheck_buf_, nullptr);
+        if (pcheck_mem_) vkFreeMemory(d, pcheck_mem_, nullptr);
+        if (persist_pool_) vkDestroyDescriptorPool(d, persist_pool_, nullptr);
+        for (VkQueryPool q : {query_pool_, ts_pool_, prof_pool_})
+            if (q) vkDestroyQueryPool(d, q, nullptr);
+        for (auto& [k, pl] : pipelines_)
+            if (pl) vkDestroyPipeline(d, pl, nullptr);
+        for (auto& [h, e] : compiling_)  // finished in the background, not yet taken into pipelines_
+            if (e.second->done.load(std::memory_order_acquire) && e.second->pipeline)
+                vkDestroyPipeline(d, e.second->pipeline, nullptr);
+        for (const PostPipe& pp : post_pipes_)
+            if (pp.pipe) vkDestroyPipeline(d, pp.pipe, nullptr);  // its render pass is in render_passes_cache_
+        {
+            std::lock_guard<std::mutex> rlk(rp_mutex_);
+            for (auto& [k, rp] : render_passes_cache_)
+                if (rp) vkDestroyRenderPass(d, rp, nullptr);
+            render_passes_cache_.clear();
+        }
+        for (auto& [k, l] : pipeline_layouts_)
+            if (l) vkDestroyPipelineLayout(d, l, nullptr);
+        for (auto& [k, l] : set_layouts_)
+            if (l) vkDestroyDescriptorSetLayout(d, l, nullptr);
+        if (post_layout_) vkDestroyPipelineLayout(d, post_layout_, nullptr);
+        if (post_set_layout_) vkDestroyDescriptorSetLayout(d, post_set_layout_, nullptr);
+        for (auto& [k, sh] : shaders_)
+            if (sh.module) vkDestroyShaderModule(d, sh.module, nullptr);
+        for (VkShaderModule m : {post_vs_, post_fsr_vs_})
+            if (m) vkDestroyShaderModule(d, m, nullptr);
+        for (VkShaderModule m : post_fs_)
+            if (m) vkDestroyShaderModule(d, m, nullptr);
+        for (auto& [k, smp] : samplers_)
+            if (smp) vkDestroySampler(d, smp, nullptr);
+        if (post_sampler_) vkDestroySampler(d, post_sampler_, nullptr);
+        if (pipeline_cache_) vkDestroyPipelineCache(d, pipeline_cache_, nullptr);
+        for (VkSemaphore sem : {acquire_sem_, render_sem_})
+            if (sem) vkDestroySemaphore(d, sem, nullptr);
+        if (pool_) vkDestroyCommandPool(d, pool_, nullptr);  // and its command buffers
+        vkDestroyDevice(d, nullptr);
+        device_ = VK_NULL_HANDLE;
+        if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+        if (instance_) vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+        // CPU-side caches: their memory back (this object is kept, with its stopped threads, but holds little).
+        images_ = {};
+        parked_ = {};
+        sharp_imgs_ = {};
+        retired_ = {};
+        capture_items_ = {};
+        fallbacks_ = {};
+        small_rts_ = {};
+        pipelines_ = {};
+        compiling_ = {};
+        post_pipes_ = {};
+        pipeline_layouts_ = {};
+        set_layouts_ = {};
+        set_layouts_fast_ = {};
+        shaders_ = {};
+        samplers_ = {};
+        etc_cache_ = {};
+        {
+            std::lock_guard<std::mutex> flk(frames_mutex_);
+            pending_frames_ = {};
+        }
+        // Hash tables only drop their entries on Clear(): new ones at the default size.
+        geo_ = decltype(geo_){};
+        stream_cache_ = decltype(stream_cache_){};
+        pipelines_fast_ = decltype(pipelines_fast_){};
+        shaders_fast_ = decltype(shaders_fast_){};
+        samplers_fast_ = decltype(samplers_fast_){};
+        desc_cache_ = decltype(desc_cache_){};
+        persist_cache_ = decltype(persist_cache_){};
+        index_ranges_ = decltype(index_ranges_){};
+        index_memo_ = decltype(index_memo_){};
+        handle_memo_ = decltype(handle_memo_){};
+        prehash_index_ = decltype(prehash_index_){};
+        prehash_jobs_.reset();  // the hashing workers have stopped (Abandon)
+        prehash_capacity_ = 0;
+        prehash_count_.store(0);
+        bc_scratch_ = {};
+        return bytes;
     }
 
 private:
@@ -1673,6 +1961,7 @@ private:
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
+        NoteLost(r, "vkAcquireNextImageKHR");
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
                 swapchain_dirty_ = true;
@@ -1736,6 +2025,7 @@ private:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &idx;
         r = vkQueuePresentKHR(queue_, &pi);
+        NoteLost(r, "vkQueuePresentKHR");
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
             swapchain_dirty_ = true;
         } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
@@ -1815,9 +2105,13 @@ private:
             const adrenotools_bcn_type bcn = adrenotools_get_bcn_type(
                 VK_VERSION_MAJOR(props_.driverVersion), VK_VERSION_MINOR(props_.driverVersion), props_.vendorID);
             if (bcn == ADRENOTOOLS_BCN_PATCH) {
-                const bool ok = adrenotools_patch_bcn(reinterpret_cast<void*>(vkGetPhysicalDeviceFormatProperties));
-                LOGI(kTag, "BC textures: driver patched by BCeNabler: %s", ok ? "ok" : "FAILED");
-                bc_patched_ = ok;
+                // Once per process: the driver stays patched in memory for a renderer made after a lost GPU.
+                static int patched = -1;
+                if (patched < 0) {
+                    patched = adrenotools_patch_bcn(reinterpret_cast<void*>(vkGetPhysicalDeviceFormatProperties)) ? 1 : 0;
+                    LOGI(kTag, "BC textures: driver patched by BCeNabler: %s", patched ? "ok" : "FAILED");
+                }
+                bc_patched_ = patched == 1;
             }
         }
         vkGetPhysicalDeviceMemoryProperties(phys_, &mem_props_);
@@ -3167,7 +3461,8 @@ private:
             std::unique_ptr<BgConversion> c;
             {
                 std::unique_lock<std::mutex> lk(bg_mutex_);
-                bg_cv_.wait(lk, [&] { return !bg_queue_.empty(); });
+                bg_cv_.wait(lk, [&] { return !bg_queue_.empty() || quit_.load(); });
+                if (bg_queue_.empty()) return;  // Abandon
                 c = std::move(bg_queue_.front());
                 bg_queue_.pop_front();
             }
@@ -3698,8 +3993,9 @@ private:
                     std::unique_lock<std::mutex> lk(rec_mutex_);
                     if (rec_queue_.empty()) {
                         rec_sleeping_ = true;
-                        rec_cv_.wait(lk, [&] { return !rec_queue_.empty(); });
+                        rec_cv_.wait(lk, [&] { return !rec_queue_.empty() || quit_.load(); });
                         rec_sleeping_ = false;
+                        if (rec_queue_.empty()) return;  // Abandon
                     }
                     b = rec_queue_.front();
                     rec_queue_.pop_front();
@@ -3934,6 +4230,7 @@ private:
             si.pSignalSemaphores = &signal;
         }
         VkResult r = vkQueueSubmit(queue_, 1, &si, sl.fence);
+        NoteLost(r, "vkQueueSubmit");
         if (r != VK_SUCCESS) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true)) LOGW(kTag, "vkQueueSubmit failed: %d", r);
@@ -3960,7 +4257,9 @@ private:
     }
     // Writes the finished readbacks of a slot to game memory (its fence has signalled).
     void DeliverReadbacks(Slot& sl) {
+        const bool lost = Lost();  // the GPU's data cannot be trusted: only the CPU's values are written
         for (const Readback& rb : sl.readbacks) {
+            if (lost && rb.report < 0) continue;
             if (rb.report >= 0) {
                 if (!GuestRangeValid(rb.dst, rb.report ? 16 : 4)) continue;
                 if (rb.report == 0) {
@@ -4032,6 +4331,7 @@ private:
     // really stuck: up to 60 s, then the whole queue), and every early return is logged.
     uint64_t fence_retries_ = 0;
     void WaitSlotFence(Slot& sl) {
+        if (Lost()) return;  // nothing finishes any more (a hung GPU would take the full timeout every time)
         const auto start = std::chrono::steady_clock::now();
         for (int attempt = 0;; attempt++) {
             const VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
@@ -4043,17 +4343,20 @@ private:
                 logged++;
                 LOGW(kTag, "GPU fence wait returned %d after %.0f ms (attempt %d): waiting again", int(r), ms, attempt + 1);
             }
-            if (r == VK_ERROR_DEVICE_LOST) {
-                LogOnce("device-lost", "the GPU device was lost: rendering can no longer be trusted");
+            if (r == VK_ERROR_DEVICE_LOST || Lost()) {
+                NoteLost(VK_ERROR_DEVICE_LOST, "fence wait");
                 return;
             }
             if (r != VK_TIMEOUT) {
                 if (vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS) return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            if (ms > 60000.0) {
-                LOGW(kTag, "GPU has not finished a frame in 60 s: waiting for the whole queue");
-                vkQueueWaitIdle(queue_);
+            // No frame takes seconds on the GPU: one that has not finished in 10 s is a hung GPU, handled like a
+            // lost one (the renderer restarts) instead of the game waiting on it for good.
+            if (ms > 10000.0) {
+                int expected = 0;
+                if (lost_.compare_exchange_strong(expected, kLostHung))
+                    LOGW(kTag, "the GPU has not finished a frame in 10 s: handled as a lost GPU (the renderer restarts)");
                 return;
             }
         }
@@ -4083,7 +4386,7 @@ private:
     void WaitGpuIdle() {
         Drain();
         MsTimer wait_timer(wait_ms_);
-        vkQueueWaitIdle(queue_);
+        if (!Lost()) NoteLost(vkQueueWaitIdle(queue_), "vkQueueWaitIdle");
         for (Slot& sl : slots_)
             if (sl.pending) {
                 DeliverReadbacks(sl);
@@ -6761,7 +7064,8 @@ private:
                     std::shared_ptr<PipelineJob> j;
                     {
                         std::unique_lock<std::mutex> lk(compile_mutex_);
-                        compile_cv_.wait(lk, [&] { return !compile_queue_.empty(); });
+                        compile_cv_.wait(lk, [&] { return !compile_queue_.empty() || quit_.load(); });
+                        if (compile_queue_.empty()) return;  // Abandon
                         j = std::move(compile_queue_.front());
                         compile_queue_.pop_front();
                     }
@@ -7035,7 +7339,8 @@ private:
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(prehash_mutex_);
-                prehash_cv_.wait(lk, [&] { return prehash_generation_ != seen; });
+                prehash_cv_.wait(lk, [&] { return prehash_generation_ != seen || quit_.load(); });
+                if (quit_.load()) return;  // Abandon
                 seen = prehash_generation_;
             }
             prehash_active_.fetch_add(1);
@@ -7298,7 +7603,8 @@ private:
             std::vector<PendingCopy> batch;
             {
                 std::unique_lock<std::mutex> lk(copy_mutex_);
-                copy_cv_.wait(lk, [&] { return !copy_queue_.empty(); });
+                copy_cv_.wait(lk, [&] { return !copy_queue_.empty() || quit_.load(); });
+                if (copy_queue_.empty()) return;  // Abandon
                 batch.swap(copy_queue_.front());
                 copy_queue_.pop_front();
             }
@@ -8738,9 +9044,57 @@ private:
     std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
 };
 
+// The backend the game talks to: a VulkanBackend, replaced by a new one when the GPU is lost (see VulkanBackend::Lost).
+// Execute and Present run on the render thread only, so the swap happens between two of its tasks. A replaced
+// backend is kept (stopped, its GPU objects freed): another thread may still be inside one of its thread-safe calls.
+class RecoveringBackend final : public Backend {
+public:
+    RecoveringBackend() : cur_(new VulkanBackend) {}
+    const char* Name() const override { return "vulkan"; }
+    void Execute(const CmdList& cmds) override { Current()->Execute(cmds); }
+    void Present(const TexRef& texture) override { Current()->Present(texture); }
+    void RequestCapture(int delay_s) override { cur_.load(std::memory_order_acquire)->RequestCapture(delay_s); }
+    void MarkTextureDirty(uint64_t addr) override { cur_.load(std::memory_order_acquire)->MarkTextureDirty(addr); }
+    void SetTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h) override {
+        cur_.load(std::memory_order_acquire)->SetTextureFrame(addr, std::move(rgba), w, h);
+    }
+
+private:
+    VulkanBackend* Current() {
+        VulkanBackend* b = cur_.load(std::memory_order_relaxed);
+        if (b->Lost()) return Replace(b, b->LostReason() == VulkanBackend::kLostTest ? "test_gpu_lost"
+                                         : b->LostReason() == VulkanBackend::kLostHung ? "the GPU hung"
+                                                                                       : "the GPU device was lost");
+        // A renderer made after a loss that could not start (the driver not ready yet): tried again, a few times.
+        if (generation_ > 1 && failed_tries_ < 10 && b->InitFailed() &&
+            std::chrono::steady_clock::now() - made_ > std::chrono::seconds(2)) {
+            failed_tries_++;
+            return Replace(b, "the new renderer could not start");
+        }
+        return b;
+    }
+    VulkanBackend* Replace(VulkanBackend* old, const char* why) {
+        generation_++;
+        LOGW(kTag, "GPU recovery %d: %s, restarting the renderer", generation_ - 1, why);
+        const DrawState st = old->TakeState();
+        old->Abandon();
+        retired_.push_back(old);
+        VulkanBackend* n = new VulkanBackend;
+        n->SetGeneration(generation_);
+        n->AdoptState(st);
+        made_ = std::chrono::steady_clock::now();
+        cur_.store(n, std::memory_order_release);
+        return n;
+    }
+    std::atomic<VulkanBackend*> cur_;
+    std::vector<VulkanBackend*> retired_;
+    int generation_ = 1, failed_tries_ = 0;
+    std::chrono::steady_clock::time_point made_{};
+};
+
 }  // namespace
 
-Backend* CreatePlatformBackend() { return new VulkanBackend; }
+Backend* CreatePlatformBackend() { return new RecoveringBackend; }
 
 }  // namespace dsr::hle::nvn
 

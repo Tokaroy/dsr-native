@@ -81,9 +81,22 @@
     X(vkCreateShaderModule)          \
     X(vkCreateSwapchainKHR)          \
     X(vkDestroyBuffer)               \
+    X(vkDestroyCommandPool)          \
+    X(vkDestroyDescriptorPool)       \
+    X(vkDestroyDescriptorSetLayout)  \
+    X(vkDestroyDevice)               \
+    X(vkDestroyFence)                \
     X(vkDestroyFramebuffer)          \
     X(vkDestroyImage)                \
     X(vkDestroyImageView)            \
+    X(vkDestroyPipeline)             \
+    X(vkDestroyPipelineCache)        \
+    X(vkDestroyPipelineLayout)       \
+    X(vkDestroyQueryPool)            \
+    X(vkDestroyRenderPass)           \
+    X(vkDestroySampler)              \
+    X(vkDestroySemaphore)            \
+    X(vkDestroyShaderModule)         \
     X(vkDestroySwapchainKHR)         \
     X(vkDeviceWaitIdle)              \
     X(vkEndCommandBuffer)            \

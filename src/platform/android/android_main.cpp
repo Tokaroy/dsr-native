@@ -522,6 +522,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
+            else if (!strcmp(key, "test_gpu_lost")) cfg->test_gpu_lost = v;
             else if (!strcmp(key, "hud_box")) cfg->hud_box = v != 0;
             else if (!strcmp(key, "compositor_scaling")) cfg->compositor_scaling = v != 0;
             else if (!strcmp(key, "max_anisotropy")) cfg->max_anisotropy = v;
@@ -696,6 +697,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
+    if (cfg->test_gpu_lost > 0)
+        LOGI(kTag, "settings: test_gpu_lost %d: the renderer restarts as after a lost GPU every %d s", cfg->test_gpu_lost,
+             cfg->test_gpu_lost);
     if (cfg->profile) dsr::profiler::Enable();
 }
 
