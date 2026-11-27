@@ -299,7 +299,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 v.addTo(activity, 0);
                 return;
             }
-            sView.setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
+            sView.mOpacity = Math.max(0.1f, Math.min(1.0f, opacity));
             sView.mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
             sView.invalidate();
         });
@@ -381,6 +381,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             float ramp = sRecenter ? Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S)) : 0f;
             ramp = ramp * ramp * (3f - 2f * ramp);  // smoothstep
             if (ramp > 0f && (mRX != mRBaseX || mRY != mRBaseY)) {
+                snapshot();
                 float k = 1f - (float) Math.exp(-dt * ramp / RECENTER_TIME_S);
                 mRBaseX += (mRX - mRBaseX) * k;
                 mRBaseY += (mRY - mRBaseY) * k;
@@ -390,7 +391,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                     mRBaseY = mRY;
                 }
                 sendState();
-                invalidate();
+                invalidateChanges();
             }
             android.view.Choreographer.getInstance().postFrameCallback(this);
         }
@@ -513,7 +514,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mActivity = activity;
         mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
         mDensity = activity.getResources().getDisplayMetrics().density;
-        setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
+        mOpacity = Math.max(0.1f, Math.min(1.0f, opacity));
         mStroke.setStyle(Paint.Style.STROKE);
         mStroke.setColor(0xFFFFFFFF);
         mText.setColor(0xFFFFFFFF);
@@ -560,6 +561,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         try {
             activity.getWindowManager().addView(this, lp);
             if (mEditTemp) return;  // only for the layout editor
+            post(() -> touchLog("touch controls drawn on the " + (isHardwareAccelerated() ? "GPU" : "CPU")));
             sView = this;
             nativeVisible(mShown);
         } catch (Exception e) {
@@ -772,8 +774,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mEditing = true;
         mSavedShown = mShown;
         mShown = true;
-        mSavedAlpha = getAlpha();
-        setAlpha(Math.max(0.85f, mSavedAlpha));
+        mSavedAlpha = mOpacity;
+        mOpacity = Math.max(0.85f, mSavedAlpha);
         mEditLayout = new HashMap<>();
         for (Map.Entry<String, float[]> e : sLayout.entrySet())
             mEditLayout.put(e.getKey(), e.getValue().clone());
@@ -795,7 +797,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         sEditing = false;
         mDragPointer = -1;
         mDragGroup = null;
-        setAlpha(mSavedAlpha);
+        mOpacity = mSavedAlpha;
         mShown = mSavedShown;
         if (mEditTemp) {
             InputManager im = (InputManager) mActivity.getSystemService(Context.INPUT_SERVICE);
@@ -977,6 +979,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (action == MotionEvent.ACTION_DOWN) checkDoubleTap(e.getX(), e.getY());
             return true;
         }
+        snapshot();
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
@@ -1004,7 +1007,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         sendState();
         logButtons();
-        invalidate();
+        invalidateChanges();
         return true;
     }
 
@@ -1278,17 +1281,100 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         if (bm == null) return false;
         float s = Math.min(w / bm.getWidth(), h / bm.getHeight());
-        float dw = bm.getWidth() * s, dh = bm.getHeight() * s;
-        mDst.set(cx - dw / 2, cy - dh / 2, cx + dw / 2, cy + dh / 2);
+        int dw = Math.max(1, Math.round(bm.getWidth() * s)), dh = Math.max(1, Math.round(bm.getHeight() * s));
         mBitmapPaint.setAlpha(alpha);
         mBitmapPaint.setColorFilter(brighten ? mPressedFilter : null);
-        c.drawBitmap(bm, null, mDst, mBitmapPaint);
+        c.drawBitmap(scaled(skin, bm, dw, dh), Math.round(cx - dw / 2f), Math.round(cy - dh / 2f), mBitmapPaint);
         return true;
+    }
+
+    // Drawn on the CPU (GameActivity is not hardware accelerated: on an Adreno 630, Android's OpenGL drawing of this
+    // window next to our Vulkan driver came out striped and its GPU context failed, killing the game). So each
+    // skin image is scaled once to its size on screen and then only copied, a touch redraws only what it changed
+    // (invalidateChanges), and the opacity is applied to the redrawn area alone (View.setAlpha would blend the
+    // whole screen-sized window on every redraw).
+    private float mOpacity = 1f;
+    private final Map<Bitmap, Bitmap> mScaled = new HashMap<>();
+    private Map<String, Bitmap> mScaledFor;
+
+    /** The skin image at w x h pixels, made once (bitmap scaling every frame is slow on the CPU). */
+    private Bitmap scaled(Map<String, Bitmap> skin, Bitmap bm, int w, int h) {
+        if (skin != mScaledFor) {  // another skin: its scaled images are made again
+            mScaled.clear();
+            mScaledFor = skin;
+        }
+        if (bm.getWidth() == w && bm.getHeight() == h) return bm;
+        Bitmap sc = mScaled.get(bm);
+        if (sc == null || sc.getWidth() != w || sc.getHeight() != h) {
+            sc = Bitmap.createScaledBitmap(bm, w, h, true);
+            mScaled.put(bm, sc);
+        }
+        return sc;
+    }
+
+    // State before a touch event, to redraw only the parts it changed.
+    private int mSnapStick, mSnapR;
+    private float mSnapSX, mSnapSY, mSnapRX, mSnapRY, mSnapRBX, mSnapRBY;
+    private long mSnapPressed;
+    private final android.graphics.Rect mDirty = new android.graphics.Rect();
+
+    private long pressedMask() {
+        long m = 0;
+        for (int i = 0; i < mButtons.size(); i++)
+            if (mButtons.get(i).pressCount > 0) m |= 1L << i;
+        return m;
+    }
+
+    private void snapshot() {
+        mSnapStick = mStickPointer;
+        mSnapSX = mStickX;
+        mSnapSY = mStickY;
+        mSnapR = mRStickPointer;
+        mSnapRX = mRX;
+        mSnapRY = mRY;
+        mSnapRBX = mRBaseX;
+        mSnapRBY = mRBaseY;
+        mSnapPressed = pressedMask();
+    }
+
+    private void addDirty(float cx, float cy, float halfW, float halfH) {
+        int pad = 3;
+        mDirty.union((int) Math.floor(cx - halfW) - pad, (int) Math.floor(cy - halfH) - pad,
+                (int) Math.ceil(cx + halfW) + pad, (int) Math.ceil(cy + halfH) + pad);
+    }
+
+    /** Redraws what changed since snapshot(): the stick, the camera stick and buttons pressed or let go. */
+    private void invalidateChanges() {
+        if (!mShown) return;
+        mDirty.setEmpty();
+        if (mStickPointer != mSnapStick || (mStickPointer >= 0 && (mStickX != mSnapSX || mStickY != mSnapSY)))
+            addDirty(mStickBaseX, mStickBaseY, 1.5f * mStickRadius, 1.5f * mStickRadius);  // base and knob travel
+        if (!sSwipe && (mRStickPointer != mSnapR || mRX != mSnapRX || mRY != mSnapRY || mRBaseX != mSnapRBX
+                || mRBaseY != mSnapRBY)) {
+            if (mSnapR >= 0) addDirty(mSnapRBX, mSnapRBY, 1.5f * mRRadius, 1.5f * mRRadius);  // where it was
+            if (mRStickPointer >= 0) addDirty(mRBaseX, mRBaseY, 1.5f * mRRadius, 1.5f * mRRadius);  // where it is
+        }
+        long changed = pressedMask() ^ mSnapPressed;
+        for (int i = 0; i < mButtons.size(); i++) {
+            if ((changed & (1L << i)) == 0) continue;
+            Button b = mButtons.get(i);
+            addDirty(b.cx, b.cy, b.w / 2, (b.round ? b.w : b.h) / 2);
+        }
+        if (!mDirty.isEmpty()) invalidate(mDirty.left, mDirty.top, mDirty.right, mDirty.bottom);
     }
 
     @Override
     protected void onDraw(Canvas c) {
         if (!mShown) return;
+        // The opacity, over the redrawn area only.
+        final int sc = mOpacity < 0.999f
+                ? c.saveLayerAlpha(new RectF(c.getClipBounds()), Math.round(255 * mOpacity))
+                : -1;
+        drawControls(c);
+        if (sc >= 0) c.restoreToCount(sc);
+    }
+
+    private void drawControls(Canvas c) {
         if (mEditing) c.drawColor(0x50000000);
         final Map<String, Bitmap> skin = sSkin;
         // Stick (the knob stays inside the ring).
@@ -1317,9 +1403,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
         // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is). Nothing is
         // drawn for the swipe camera.
         if (mRStickPointer >= 0 && !sSwipe) {
-            final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
+            final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, mOpacity))));
             // A skin's camera ring is an image of its own: shown at 40% (the plain one, a faint outline, at 10%).
-            final int sa = Math.max(1, Math.min(255, Math.round(255 * 0.40f / Math.max(0.1f, getAlpha()))));
+            final int sa = Math.max(1, Math.min(255, Math.round(255 * 0.40f / Math.max(0.1f, mOpacity))));
             if (!drawSkin(c, skin, "ring", false, mRBaseX, mRBaseY, 2 * mRRadius, 2 * mRRadius, sa)) {
                 mFill.setColor(a << 24);
                 c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);

@@ -27,8 +27,12 @@
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
+        <!-- Not hardware accelerated: the touch controls, fps counter and settings menu are drawn on the CPU. On an
+             Adreno 630 (OnePlus 6T) Android's OpenGL drawing of them, in the same process as our Vulkan driver,
+             came out striped and then lost its GPU context, which got the game killed. -->
         <activity
             android:name=".GameActivity"
+            android:hardwareAccelerated="false"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"
