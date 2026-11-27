@@ -20,8 +20,8 @@ uint64_t g_touch_buttons = 0;
 float g_touch_lx = 0, g_touch_ly = 0, g_touch_rx = 0, g_touch_ry = 0;
 int32_t ToStick(float v) { return int32_t(std::lround(std::max(-1.0f, std::min(1.0f, v)) * 32767.0f)); }
 // Touch camera (swipe mode): the game's pad code turns a stick into value * 2 / 65535 with no limit (main+0x81a698,
-// 1.0.0), so a value past full tilt may turn the camera faster than a stick can. Up to 4x full tilt, touch only.
-constexpr float kTouchCameraMax = 4.0f;
+// 1.0.0), so a value past full tilt may turn the camera faster than a stick can. Up to 6x full tilt, touch only.
+constexpr float kTouchCameraMax = 6.0f;
 int32_t ToStickWide(float v) {
     return int32_t(std::lround(std::max(-kTouchCameraMax, std::min(kTouchCameraMax, v)) * 32767.0f));
 }

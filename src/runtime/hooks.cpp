@@ -259,6 +259,9 @@ std::mutex g_probe_mutex;
 std::unordered_set<uint64_t> g_probe_seen;
 
 void CamNote(int i, float v);
+// The swipe camera's diagnostics (pad probe, action probe and read trap, action / turn getter probes, per-second
+// camera line): off now that the camera's caps are found; they cost a fault or a lock per read.
+constexpr bool kCameraDiagnostics = false;
 
 float PadAnalogProbe(const uint8_t* self, int index) {
     const unsigned i = unsigned(index - 3);
@@ -321,7 +324,7 @@ void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zon
     // Every channel capped at full tilt is allowed to 4: only the touch swipe camera sends more than 1 (controllers
     // and the touch sticks stop at 1). The camera's actions (18 / 19) come from entries without a dead zone, clamped
     // per axis, so raising only the right stick's dead-zone entries (channels 3 / 4) left a cap of 1 per axis.
-    if (*max >= 0.99f && *max <= 1.01f) *max = 4.0f;
+    if (*max >= 0.99f && *max <= 1.01f) *max = 8.0f;
 }
 
 // The action mapping (df37 main+0x81c848, used by main+0x82ffa8): after the channels, each action's frame value gets
@@ -348,7 +351,7 @@ void ActionMapEntry(const uint8_t* self, int i, uint32_t* action, uint32_t* pair
     memcpy(scale, e + 16, 4);
     memcpy(max, e + 20, 4);
     memcpy(f24, e + 24, 4);
-    if (*max >= 0.99f && *max <= 1.01f && dsr::input::TouchCameraTilt() > 1.0f) *max = 4.0f;
+    if (*max >= 0.99f && *max <= 1.01f && dsr::input::TouchSwipeActive()) *max = 8.0f;
 }
 
 // The input layer's action setter (df37 main+0x82c900): each device channel that drives a user action passes its value
@@ -761,6 +764,7 @@ std::mutex g_cam_mutex;
 float g_cam_max[10];  // touch, vector in, vector out, action 26 in, turn out, pad raw, 18 x / 19 y, getter 6/7, 26/27
 std::chrono::steady_clock::time_point g_cam_next;
 void CamNote(int i, float v) {
+    if (!kCameraDiagnostics) return;
     std::lock_guard<std::mutex> lk(g_cam_mutex);
     g_cam_max[i] = std::max(g_cam_max[i], std::fabs(v));
     g_cam_max[0] = std::max(g_cam_max[0], dsr::input::TouchCameraTilt());
@@ -860,14 +864,14 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
     float rx = 0.0f, ry = 0.0f;
     if (len > 0.37f && std::isfinite(len)) {
         float m = std::max(0.0f, (len - 0.37f) * 1.7241380214691162f);
-        if (m > 1.0f && dsr::input::TouchCameraTilt() <= 1.0f) m = 1.0f;
+        if (m > 1.0f && !dsr::input::TouchSwipeActive()) m = 1.0f;
         rx = x / len * m;
         ry = y / len * m;
     }
 #if defined(__aarch64__)
     TrapRearm();
 #endif
-    {   // diagnostics: each caller (with its two actions) once, then the first time it gets past full tilt
+    if (kCameraDiagnostics) {  // each caller (with its two actions) once, then the first time it gets past full tilt
         const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         const uint64_t key = (uint64_t(ret) << 16) | (uint64_t(ix & 0xFF) << 8) | uint64_t(iy & 0xFF);
         const bool past = len > 0.37f + 1.0f / 1.7241380214691162f + 0.05f;
@@ -922,53 +926,56 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
             LOGW("hooks", "stick vector hook failed: %s", err.c_str());
     }
 
-    for (const StickVecHook& h : kActionGetHooks) {
-        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-        // ldr x8,[x0,#8] / ldr x8,[x8,#32] / ldr s0,[x8,w1,sxtw #2] / ret
-        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
-        std::string err;
-        if (code[0] != 0xF9400408 || code[1] != 0xF9401108 || code[3] != 0xD65F03C0)
-            LOGW("hooks", "action getter not found at main+0x%lx", (unsigned long)h.fn);
-        else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&ActionGet), &err))
-            LOGI("hooks", "action getter: probe");
-        else
-            LOGW("hooks", "action getter hook failed: %s", err.c_str());
-    }
-
-    for (const TurnHook& h : kTurnHooks) {
-        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-        for (int k = 0; k < 2; k++) {
-            // ldr x0,[x0,#8] / mov w1,#26+k / bl / adrp / ldr s1 / fmul s0,s0,s1
-            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn[k]);
-            if (code[2] != 0xF9400400 || code[3] != 0x52800341u + (uint32_t(k) << 5) || code[7] != 0x1E210800) {
-                LOGW("hooks", "camera turn getter %d not found at main+0x%lx", k, (unsigned long)h.fn[k]);
-                continue;
-            }
-            // the scale: adrp (page) + ldr s1, [x8, #imm]
-            const uint64_t at = h.fn[k] + 20;
-            const uint32_t adrp = code[5], ldr = code[6];
-            const int64_t imm = int64_t((((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3)) << 44 >> 32;
-            const uint64_t page = (at & ~0xFFFull) + uint64_t(imm);
-            memcpy(&g_turn_scale[k], reinterpret_cast<const void*>(rt.main.base() + page + ((ldr >> 10) & 0xFFF) * 4), 4);
+    if (kCameraDiagnostics) {
+        for (const StickVecHook& h : kActionGetHooks) {
+            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+            // ldr x8,[x0,#8] / ldr x8,[x8,#32] / ldr s0,[x8,w1,sxtw #2] / ret
+            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
             std::string err;
-            if (rt.main.HookFunction(h.fn[k], reinterpret_cast<void*>(k ? &TurnGetter<1> : &TurnGetter<0>), &err))
-                LOGI("hooks", "camera turn getter %d: probe (scale %.5f)", k, g_turn_scale[k]);
+            if (code[0] != 0xF9400408 || code[1] != 0xF9401108 || code[3] != 0xD65F03C0)
+                LOGW("hooks", "action getter not found at main+0x%lx", (unsigned long)h.fn);
+            else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&ActionGet), &err))
+                LOGI("hooks", "action getter: probe");
             else
-                LOGW("hooks", "camera turn getter %d hook failed: %s", k, err.c_str());
+                LOGW("hooks", "action getter hook failed: %s", err.c_str());
         }
-    }
 
-    for (const ActionSetHook& h : kActionSetHooks) {
-        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-        // ldr x9,[x0,#208] / ldr x10,[x0,#248] / sbfiz x11,x1,#2,#32
-        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.setter);
-        std::string err;
-        if (code[0] != 0xF9406809 || code[1] != 0xF9407C0A)
-            LOGW("hooks", "input action setter not found at main+0x%lx", (unsigned long)h.setter);
-        else if (rt.main.HookFunction(h.setter, reinterpret_cast<void*>(&ActionSet), &err))
-            LOGI("hooks", "input action probe: logging the actions the sticks drive");
-        else
-            LOGW("hooks", "input action hook failed: %s", err.c_str());
+        for (const TurnHook& h : kTurnHooks) {
+            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+            for (int k = 0; k < 2; k++) {
+                // ldr x0,[x0,#8] / mov w1,#26+k / bl / adrp / ldr s1 / fmul s0,s0,s1
+                const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn[k]);
+                if (code[2] != 0xF9400400 || code[3] != 0x52800341u + (uint32_t(k) << 5) || code[7] != 0x1E210800) {
+                    LOGW("hooks", "camera turn getter %d not found at main+0x%lx", k, (unsigned long)h.fn[k]);
+                    continue;
+                }
+                // the scale: adrp (page) + ldr s1, [x8, #imm]
+                const uint64_t at = h.fn[k] + 20;
+                const uint32_t adrp = code[5], ldr = code[6];
+                const int64_t imm = int64_t((((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3)) << 44 >> 32;
+                const uint64_t page = (at & ~0xFFFull) + uint64_t(imm);
+                memcpy(&g_turn_scale[k], reinterpret_cast<const void*>(rt.main.base() + page + ((ldr >> 10) & 0xFFF) * 4), 4);
+                std::string err;
+                if (rt.main.HookFunction(h.fn[k], reinterpret_cast<void*>(k ? &TurnGetter<1> : &TurnGetter<0>), &err))
+                    LOGI("hooks", "camera turn getter %d: probe (scale %.5f)", k, g_turn_scale[k]);
+                else
+                    LOGW("hooks", "camera turn getter %d hook failed: %s", k, err.c_str());
+            }
+        }
+
+        for (const ActionSetHook& h : kActionSetHooks) {
+            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+            // ldr x9,[x0,#208] / ldr x10,[x0,#248] / sbfiz x11,x1,#2,#32
+            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.setter);
+            std::string err;
+            if (code[0] != 0xF9406809 || code[1] != 0xF9407C0A)
+                LOGW("hooks", "input action setter not found at main+0x%lx", (unsigned long)h.setter);
+            else if (rt.main.HookFunction(h.setter, reinterpret_cast<void*>(&ActionSet), &err))
+                LOGI("hooks", "input action probe: logging the actions the sticks drive");
+            else
+                LOGW("hooks", "input action hook failed: %s", err.c_str());
+        }
+
     }
 
     for (const MapEntryHook& h : kMapEntryHooks) {
@@ -998,6 +1005,7 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
             LOGW("hooks", "action mapping hook failed: %s", err.c_str());
     }
 
+    if (!kCameraDiagnostics) return;
     const PadProbe* p = nullptr;
     for (const PadProbe& c : kPadProbes)
         if (!strncmp(c.build_id, b.build_id, strlen(c.build_id))) p = &c;

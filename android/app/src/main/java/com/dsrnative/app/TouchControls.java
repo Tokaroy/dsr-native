@@ -406,8 +406,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
     // a fast flick still turns the camera about as far as the thumb went.
     private static final float STICK_DEAD_ZONE = 0.37f, STICK_SCALE = 1f / 1.7241380f;  // the stick vector's: full at 0.95
-    private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.05f, SWIPE_CURVE = 0.7f,
-            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f, SWIPE_MAX_TILT = 4f;  // carry-over off: it kept turning after the thumb lifted
+    // While swiping, the camera turns by the tilt times its slowest turn speed (native code skips the game's turn ramp),
+    // so the tilt follows the thumb's speed linearly: the camera turns the same angle for the same thumb travel at any
+    // speed. Curve and minimum tilt are off (they made the turn per distance change with speed); smoothing is a little
+    // longer (thumb speed measured per display frame jitters, and that now shows directly as camera judder).
+    private static final float SWIPE_FULL_DP_S = 220f, SWIPE_MIN_TILT = 0f, SWIPE_CURVE = 1f,
+            SWIPE_SMOOTH_S = 0.04f, SWIPE_DEBT_MAX_S = 0f, SWIPE_MAX_TILT = 8f;  // carry-over off: it kept turning after the thumb lifted
     private float mSwipeDebtX, mSwipeDebtY;  // full-tilt seconds the cap cut off, per axis (signed)
     private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
     private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
@@ -431,12 +435,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
             } else {
                 // Lift past the game's dead zone and keep the direction. Past full tilt the value goes on rising
                 // with the thumb's speed (up to SWIPE_MAX_TILT): the game's pad code does not cap it, so a fast
-                // flick may turn the camera faster than a stick can (native code lets touch go to 4x).
+                // flick may turn the camera faster than a stick can (native code lets touch go to 6x, the camera 8x).
                 // The camera reads the right stick through actions with no dead zone in the input mapping (18 / 19,
                 // logged), then the stick vector's radial dead zone of 0.37: length (len - 0.37) * 1.724, capped at 1
                 // (lifted for the swipe camera past full tilt). Sending 0.37 + 0.58 * d makes the camera see d.
-                float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
-                float want = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
+                float want = len > 1f ? Math.min(len, SWIPE_MAX_TILT)
+                        : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * (SWIPE_CURVE == 1f ? len : (float) Math.pow(len, SWIPE_CURVE));
                 float t = STICK_DEAD_ZONE + STICK_SCALE * want;
                 rx = wx / len * t;
                 ry = wy / len * t;
