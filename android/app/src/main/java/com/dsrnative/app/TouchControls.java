@@ -57,6 +57,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
      * floating camera stick.
      */
     static volatile boolean sSwipe = true;  // touch_camera_mode: swipe unless set to stick
+    /**
+     * settings.txt touch_draw = gpu: the controls' window is drawn by Android's OpenGL renderer again (GameActivity
+     * itself is not hardware accelerated, see the manifest). Default cpu (an Adreno 630 with Turnip striped the
+     * stick and lost its GPU context); a test of whether CPU drawing makes the swipe camera judder on other devices.
+     */
+    static volatile boolean sGpuDraw = false;
     /** Offsets of the groups from their default spots, in layout units (settings.txt touch_layout). */
     private static volatile Map<String, float[]> sLayout = new HashMap<>();
     /** Groups that can be moved, in settings.txt. */
@@ -556,6 +562,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         lp.token = decor.getWindowToken();
+        if (sGpuDraw) lp.flags |= WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         try {

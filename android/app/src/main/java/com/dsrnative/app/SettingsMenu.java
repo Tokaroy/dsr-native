@@ -103,6 +103,7 @@ public final class SettingsMenu {
         Strings.setLanguage(v.containsKey("language") ? v.get("language") : "en-US");
         TouchControls.sRecenter = !"0".equals(v.get("touch_camera_recenter"));
         TouchControls.sSwipe = !"stick".equals(v.get("touch_camera_mode"));  // swipe by default
+        TouchControls.sGpuDraw = "gpu".equals(v.get("touch_draw"));
         TouchControls.setLayout(v.get("touch_layout"));
         TouchControls.prepareSkinsDir(settingsPath);
         TouchControls.setSkin(activity, v.get("touch_skin"), settingsPath);
