@@ -24,6 +24,7 @@
 #include <mutex>
 #include <map>
 
+#include "hle/input.h"
 #include "common/log.h"
 #include "hle/os/heap.h"
 #include "hle/os/os.h"
@@ -460,7 +461,53 @@ void ActionSet(uint8_t* self, int id, float v) {
 #endif
 }
 
+// The game's stick vector (df37 main+0x694d20, found with the read trap): actions (x, y) from the published array,
+// a second radial dead zone of 0.37, then length = clamp((len - 0.37) * 1.724, 0, 1) along the stick's direction,
+// returned as two floats in x0. That clamp to 1 is the camera's speed cap. Replaced by the same code without the
+// clamp while the touch swipe camera sends more than full tilt (its length past 1; a stick never gets there, the
+// touch stick is clamped to 1), so controllers, the left stick and the touch stick behave as before.
+struct StickVecHook {
+    const char* build_id;
+    uint64_t fn;
+};
+const StickVecHook kStickVecHooks[] = {
+    {"5a797a3a", 0x69a058},
+    {"6569410c", 0x694d50},
+    {"df3766a2", 0x694d20},
+};
+uint64_t StickVector(const uint8_t* self, int ix, int iy) {
+    const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32);
+    const float x = a[ix], y = a[iy];
+    const float len = std::sqrt(x * x + y * y);
+    float rx = 0.0f, ry = 0.0f;
+    if (len > 0.37f && std::isfinite(len)) {
+        float m = std::max(0.0f, (len - 0.37f) * 1.7241380214691162f);
+        if (m > 1.0f && dsr::input::TouchCameraTilt() <= 1.0f) m = 1.0f;
+        rx = x / len * m;
+        ry = y / len * m;
+    }
+    uint32_t bx, by;
+    memcpy(&bx, &rx, 4);
+    memcpy(&by, &ry, 4);
+    return uint64_t(bx) | (uint64_t(by) << 32);
+}
+
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    for (const StickVecHook& h : kStickVecHooks) {
+        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+        // ldr x8,[x0,#8] / ldr x8,[x8,#0x20] / ldr s10,[x8,w1,sxtw #2] within the first 8 instructions
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
+        bool ok = false;
+        for (int k = 0; k < 8; k++) ok |= code[k] == 0xF9400408 && code[k + 1] == 0xF9401108;
+        std::string err;
+        if (!ok)
+            LOGW("hooks", "stick vector not found at main+0x%lx", (unsigned long)h.fn);
+        else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&StickVector), &err))
+            LOGI("hooks", "swipe camera: the camera turns past the stick's top speed for fast swipes");
+        else
+            LOGW("hooks", "stick vector hook failed: %s", err.c_str());
+    }
+
     for (const ActionSetHook& h : kActionSetHooks) {
         if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
         // ldr x9,[x0,#208] / ldr x10,[x0,#248] / sbfiz x11,x1,#2,#32

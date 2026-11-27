@@ -406,6 +406,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
     // a fast flick still turns the camera about as far as the thumb went.
     private static final float GAME_DEAD_ZONE = 0.25f;
+    private static final float STICK_DEAD_ZONE = 0.37f, STICK_SCALE = 1f / 1.7241380f;  // the stick vector's: full at 0.95
     private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.05f, SWIPE_CURVE = 0.7f,
             SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f, SWIPE_MAX_TILT = 4f;  // carry-over off: it kept turning after the thumb lifted
     private float mSwipeDebtX, mSwipeDebtY;  // full-tilt seconds the cap cut off, per axis (signed)
@@ -432,11 +433,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 // Lift past the game's dead zone and keep the direction. Past full tilt the value goes on rising
                 // with the thumb's speed (up to SWIPE_MAX_TILT): the game's pad code does not cap it, so a fast
                 // flick may turn the camera faster than a stick can (native code lets touch go to 4x).
-                // The game's input mapping has a radial dead zone of 0.25 on the right stick and rescales the rest
-                // to 0..1 (logged from the game's table): sending 0.25 + 0.75 * d makes it see exactly d.
+                // The game takes two dead zones off the right stick: 0.25 in its input mapping (rescaled to 0..1),
+                // then 0.37 in its stick vector (length (len - 0.37) * 1.724, capped at 1 - the cap is lifted for
+                // the swipe camera past full tilt). Sending 0.25 + 0.75 * (0.37 + 0.58 * d) makes the camera see d.
                 float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
                 float want = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
-                float t = GAME_DEAD_ZONE + (1f - GAME_DEAD_ZONE) * want;
+                float t = GAME_DEAD_ZONE + (1f - GAME_DEAD_ZONE) * (STICK_DEAD_ZONE + STICK_SCALE * want);
                 rx = wx / len * t;
                 ry = wy / len * t;
                 if (len > SWIPE_MAX_TILT) {  // past the most we send: keep what is cut off
@@ -1169,6 +1171,11 @@ public final class TouchControls extends View implements InputManager.InputDevic
             float reach = mRRadius / mCameraSpeed;
             rx = Math.max(-1f, Math.min(1f, (mRX - mRBaseX) / reach));
             ry = Math.max(-1f, Math.min(1f, -(mRY - mRBaseY) / reach));
+            float rl = (float) Math.sqrt(rx * rx + ry * ry);
+            if (rl > 1f) {  // at most full tilt (past 1 lifts the game's camera cap: swipe camera only)
+                rx /= rl;
+                ry /= rl;
+            }
             if (Math.abs(rx) < 0.06f && Math.abs(ry) < 0.06f) rx = ry = 0;
         }
         nativeState(bits, lx, ly, rx, ry);

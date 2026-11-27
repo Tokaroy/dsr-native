@@ -22,6 +22,8 @@ struct PadState {
 void SetPad(const PadState& s);
 // Touch controls (merged with the controller): buttons held and the on-screen sticks (-1..1, +y = up).
 void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry);
+// Length of the touch right stick (0 when not touched); past 1 only from the swipe camera.
+float TouchCameraTilt();
 // HLE side: snapshot plus a monotonically increasing sampling number.
 PadState GetPad(int64_t* sampling_number);
 

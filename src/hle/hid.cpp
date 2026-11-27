@@ -38,6 +38,10 @@ void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry) {
     g_touch_rx = rx;
     g_touch_ry = ry;
 }
+float TouchCameraTilt() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return std::sqrt(g_touch_rx * g_touch_rx + g_touch_ry * g_touch_ry);
+}
 PadState GetPad(int64_t* sampling) {
     if (sampling) *sampling = dsr::hle::os::NowNs() / 4'000'000;  // ~250 Hz sampling counter
     std::lock_guard<std::mutex> lk(g_mutex);
