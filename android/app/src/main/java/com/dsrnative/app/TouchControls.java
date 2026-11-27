@@ -406,7 +406,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
     // a fast flick still turns the camera about as far as the thumb went.
     private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.30f, SWIPE_CURVE = 0.7f,
-            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0.35f;
+            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f;  // carry-over off: it kept turning after the thumb lifted
     private float mSwipeDebtX, mSwipeDebtY;  // full-tilt seconds the cap cut off, per axis (signed)
     private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
     private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
