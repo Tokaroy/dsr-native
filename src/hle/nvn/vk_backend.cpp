@@ -1958,9 +1958,34 @@ private:
                              nullptr, 1, &b);
     }
     // Recorder: acquires a swapchain image, copies the frame into it, submits slot i and presents.
+    // Diagnostics: how long the recorder spends in the driver's presentation calls and in submissions (a driver whose
+    // present or acquire waits for the GPU holds up the next frame's recording: the GPU then idles, malisx2 on a
+    // Mali-G68 was 81% busy against 99% with the system driver). Totals and the longest, per 10 s.
+    struct CallTime {
+        std::atomic<uint64_t> ns{0}, max_ns{0}, calls{0};
+        void Add(std::chrono::steady_clock::time_point t0) {
+            const uint64_t d = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - t0).count());
+            ns.fetch_add(d, std::memory_order_relaxed);
+            calls.fetch_add(1, std::memory_order_relaxed);
+            uint64_t m = max_ns.load(std::memory_order_relaxed);
+            while (d > m && !max_ns.compare_exchange_weak(m, d, std::memory_order_relaxed)) {
+            }
+        }
+        std::string Take() {
+            const uint64_t n = calls.exchange(0), t = ns.exchange(0), m = max_ns.exchange(0);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%.0f ms in %llu calls (%.2f ms each, longest %.1f ms)", t / 1e6,
+                     (unsigned long long)n, n ? t / 1e6 / double(n) : 0.0, m / 1e6);
+            return buf;
+        }
+    };
+    CallTime t_acquire_, t_present_, t_submit_;
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
+        const auto ta = std::chrono::steady_clock::now();
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
+        t_acquire_.Add(ta);
         NoteLost(r, "vkAcquireNextImageKHR");
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
@@ -2024,7 +2049,9 @@ private:
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &idx;
+        const auto tp = std::chrono::steady_clock::now();
         r = vkQueuePresentKHR(queue_, &pi);
+        t_present_.Add(tp);
         NoteLost(r, "vkQueuePresentKHR");
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
             swapchain_dirty_ = true;
@@ -4229,7 +4256,9 @@ private:
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &signal;
         }
+        const auto ts = std::chrono::steady_clock::now();
         VkResult r = vkQueueSubmit(queue_, 1, &si, sl.fence);
+        t_submit_.Add(ts);
         NoteLost(r, "vkQueueSubmit");
         if (r != VK_SUCCESS) {
             static std::atomic<bool> logged{false};
@@ -7707,6 +7736,8 @@ private:
                  "%llu extra descriptor pools; %llu draws without descriptor sets",
                  rec_ns_.exchange(0) / 1e6, drain_ms_, (unsigned long long)rec_batches_,
                  (unsigned long long)desc_pools_added_, (unsigned long long)skipped_desc_);
+            LOGI(kTag, "recorder in the driver (last 10 s): image acquire %s; present %s; submit %s",
+                 t_acquire_.Take().c_str(), t_present_.Take().c_str(), t_submit_.Take().c_str());
             drain_ms_ = 0;
             rec_batches_ = 0;
         }
