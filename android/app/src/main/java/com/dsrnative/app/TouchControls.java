@@ -405,7 +405,6 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // A swipe faster than full tilt can follow would be cut short (the game caps its turn rate): what the cap cut
     // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
     // a fast flick still turns the camera about as far as the thumb went.
-    private static final float GAME_DEAD_ZONE = 0.25f;
     private static final float STICK_DEAD_ZONE = 0.37f, STICK_SCALE = 1f / 1.7241380f;  // the stick vector's: full at 0.95
     private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.05f, SWIPE_CURVE = 0.7f,
             SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f, SWIPE_MAX_TILT = 4f;  // carry-over off: it kept turning after the thumb lifted
@@ -433,12 +432,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 // Lift past the game's dead zone and keep the direction. Past full tilt the value goes on rising
                 // with the thumb's speed (up to SWIPE_MAX_TILT): the game's pad code does not cap it, so a fast
                 // flick may turn the camera faster than a stick can (native code lets touch go to 4x).
-                // The game takes two dead zones off the right stick: 0.25 in its input mapping (rescaled to 0..1),
-                // then 0.37 in its stick vector (length (len - 0.37) * 1.724, capped at 1 - the cap is lifted for
-                // the swipe camera past full tilt). Sending 0.25 + 0.75 * (0.37 + 0.58 * d) makes the camera see d.
+                // The camera reads the right stick through actions with no dead zone in the input mapping (18 / 19,
+                // logged), then the stick vector's radial dead zone of 0.37: length (len - 0.37) * 1.724, capped at 1
+                // (lifted for the swipe camera past full tilt). Sending 0.37 + 0.58 * d makes the camera see d.
                 float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
                 float want = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
-                float t = GAME_DEAD_ZONE + (1f - GAME_DEAD_ZONE) * (STICK_DEAD_ZONE + STICK_SCALE * want);
+                float t = STICK_DEAD_ZONE + STICK_SCALE * want;
                 rx = wx / len * t;
                 ry = wy / len * t;
                 if (len > SWIPE_MAX_TILT) {  // past the most we send: keep what is cut off

@@ -312,7 +312,10 @@ void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zon
     if (i >= 0 && i < 64 && !(logged.fetch_or(1ull << i) & (1ull << i)))
         LOGI("hooks", "input mapping %d: channel %d (pair %d), dead zone %.3f, threshold %.3f, scale %.3f, max %.3f, "
              "flag %u", i, *channel, *pair, *dead_zone, *threshold, *scale, *max, *flag);
-    if ((*channel == 3 || *channel == 4) && *max >= 0.99f && *max < 4.0f) *max = 4.0f;
+    // Every channel capped at full tilt is allowed to 4: only the touch swipe camera sends more than 1 (controllers
+    // and the touch sticks stop at 1). The camera's actions (18 / 19) come from entries without a dead zone, clamped
+    // per axis, so raising only the right stick's dead-zone entries (channels 3 / 4) left a cap of 1 per axis.
+    if (*max >= 0.99f && *max <= 1.01f) *max = 4.0f;
 }
 
 // The input layer's action setter (df37 main+0x82c900): each device channel that drives a user action passes its value
@@ -560,7 +563,7 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
         if (code[0] != 0xF9400409 || code[1] != 0x321E0BEA || code[2] != 0x9B2A7C2B)
             LOGW("hooks", "input mapping getter not found at main+0x%lx", (unsigned long)h.getter);
         else if (rt.main.HookFunction(h.getter, reinterpret_cast<void*>(&InputMapEntry), &err))
-            LOGI("hooks", "input mapping: right stick allowed past full tilt (touch swipe camera test)");
+            LOGI("hooks", "input mapping: channels allowed past full tilt (only the touch swipe camera sends more)");
         else
             LOGW("hooks", "input mapping hook failed: %s", err.c_str());
     }
