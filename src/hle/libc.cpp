@@ -21,6 +21,7 @@
 
 #include "arch/arch.h"
 #include "common/log.h"
+#include "hle/os/write_watch.h"
 #include "hle/registry.h"
 #include "runtime/runtime.h"
 
@@ -54,6 +55,12 @@ struct LibcEntry {
 
 #define C(name, type) {#name, reinterpret_cast<void*>(static_cast<type>(&::name))}
 #define P(name) {#name, reinterpret_cast<void*>(&::name)}
+// fread can have the kernel read straight into the caller's buffer: a page the geometry write tracking made
+// read-only would fail it (EFAULT) instead of faulting, so the buffer's pages are released first.
+size_t TrackedFread(void* buf, size_t size, size_t n, FILE* f) {
+    if (size && n) dsr::hle::os::WatchBeforeWrite(buf, size * n);
+    return ::fread(buf, size, n, f);
+}
 
 using d_d = double (*)(double);
 using f_f = float (*)(float);
@@ -89,7 +96,7 @@ const LibcEntry kDirect[] = {
     // formatted I/O (variadic: identical AAPCS64 convention on both sides)
     P(sprintf), P(snprintf), P(vsnprintf), P(vsprintf), P(sscanf), P(swprintf), P(fscanf),
     // stdio on host FILE* handles (opaque to the guest)
-    P(fopen), P(fclose), P(fflush), P(fread), P(fwrite), P(fseek), P(ftell), P(fseeko), P(ftello), P(fgets),
+    P(fopen), P(fclose), P(fflush), {"fread", reinterpret_cast<void*>(&TrackedFread)}, P(fwrite), P(fseek), P(ftell), P(fseeko), P(ftello), P(fgets),
     P(fgetws), P(getc), P(ungetc), P(feof), P(ferror), P(fputc), P(remove), P(rename),
     // time
     P(time), P(clock), P(difftime), P(mktime), P(gmtime), P(localtime), P(gmtime_r), P(localtime_r), P(timegm),
