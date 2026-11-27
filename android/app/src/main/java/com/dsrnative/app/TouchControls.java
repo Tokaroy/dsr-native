@@ -435,8 +435,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 // The game's input mapping has a radial dead zone of 0.25 on the right stick and rescales the rest
                 // to 0..1 (logged from the game's table): sending 0.25 + 0.75 * d makes it see exactly d.
                 float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
-                float d = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
-                float t = GAME_DEAD_ZONE + (1f - GAME_DEAD_ZONE) * d;
+                float want = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
+                float t = GAME_DEAD_ZONE + (1f - GAME_DEAD_ZONE) * want;
                 rx = wx / len * t;
                 ry = wy / len * t;
                 if (len > SWIPE_MAX_TILT) {  // past the most we send: keep what is cut off
