@@ -837,16 +837,23 @@ float ActionGet(const uint8_t* self, int id) {
 // input times the slowest speed. That ramp is the swipe camera's cap and its lag (a flick ends before the ramp is up).
 // While the touch swipe camera is used, the branch into the ramp is replaced by a jump to the proportional turn, so
 // the camera turns by exactly what the swipe sends; restored when the thumb lifts (sticks keep the game's feel).
+// The camera's follow (df37 main+0xab780): when the character has moved this frame (w19), the camera's angles are
+// worked out again from where the camera now is to the character - so the camera turns after a walking character,
+// against the swipe (and with a stick too: that is the game's own behaviour). While swiping that block is jumped
+// over (cbz w19 -> b), so the camera keeps the angle the thumb gave it and only moves along with the character.
 struct RampPatch {
     const char* build_id;
     uint64_t at;
     uint32_t orig, repl;  // b.le <proportional> / b <proportional>
+    uint64_t follow_at;
+    uint32_t follow_orig, follow_repl;  // cbz w19, <past> / b <past>
 };
 const RampPatch kRampPatches[] = {
-    {"5a797a3a", 0xae554, 0x5400020D, 0x14000010},
-    {"6569410c", 0xab8c8, 0x5400022D, 0x14000011},
-    {"df3766a2", 0xab8c8, 0x5400022D, 0x14000011},
+    {"5a797a3a", 0xae554, 0x5400020D, 0x14000010, 0xae41c, 0x340001B3, 0x1400000D},
+    {"6569410c", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E},
+    {"df3766a2", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E},
 };
+bool g_follow_ok = false;
 loader::Module* g_ramp_module = nullptr;
 const RampPatch* g_ramp = nullptr;
 std::atomic<bool> g_ramp_off{false};
@@ -855,6 +862,9 @@ void SetCameraProportional(bool on) {
     g_ramp_off = on;
     const uint32_t w = on ? g_ramp->repl : g_ramp->orig;
     if (!g_ramp_module->WriteReadOnly(g_ramp->at, &w, 4)) LOGW("hooks", "swipe camera: camera ramp patch failed");
+    const uint32_t f = on ? g_ramp->follow_repl : g_ramp->follow_orig;
+    if (g_follow_ok && !g_ramp_module->WriteReadOnly(g_ramp->follow_at, &f, 4))
+        LOGW("hooks", "swipe camera: camera follow patch failed");
 }
 
 uint64_t StickVector(const uint8_t* self, int ix, int iy) {
@@ -908,6 +918,10 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
         }
         g_ramp_module = &rt.main;
         g_ramp = &r;
+        // cbz w19 / ldr q0, [x20, #208] / ldr q1, [x20, #256]
+        const uint32_t* fc = reinterpret_cast<const uint32_t*>(rt.main.base() + r.follow_at);
+        g_follow_ok = fc[0] == r.follow_orig && fc[1] == 0x3DC03680 && fc[2] == 0x3DC04281;
+        if (!g_follow_ok) LOGW("hooks", "swipe camera: camera follow not found at main+0x%lx", (unsigned long)r.follow_at);
         LOGI("hooks", "swipe camera: the camera's turn ramp is skipped while swiping (main+0x%lx)", (unsigned long)r.at);
     }
 
