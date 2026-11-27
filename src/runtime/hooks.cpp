@@ -827,6 +827,32 @@ float ActionGet(const uint8_t* self, int id) {
     return v;
 }
 
+// The camera's yaw (df37 main+0xab8c4, in the camera update): while the horizontal input is past a small threshold,
+// the camera turns at a speed that ramps from its slowest to its fastest over a set time (+312 counts it up, +480 the
+// time), in the input's direction only - how far the stick is pushed does not count. Below the threshold it turns by
+// input times the slowest speed. That ramp is the swipe camera's cap and its lag (a flick ends before the ramp is up).
+// While the touch swipe camera is used, the branch into the ramp is replaced by a jump to the proportional turn, so
+// the camera turns by exactly what the swipe sends; restored when the thumb lifts (sticks keep the game's feel).
+struct RampPatch {
+    const char* build_id;
+    uint64_t at;
+    uint32_t orig, repl;  // b.le <proportional> / b <proportional>
+};
+const RampPatch kRampPatches[] = {
+    {"5a797a3a", 0xae554, 0x5400020D, 0x14000010},
+    {"6569410c", 0xab8c8, 0x5400022D, 0x14000011},
+    {"df3766a2", 0xab8c8, 0x5400022D, 0x14000011},
+};
+loader::Module* g_ramp_module = nullptr;
+const RampPatch* g_ramp = nullptr;
+std::atomic<bool> g_ramp_off{false};
+void SetCameraProportional(bool on) {
+    if (!g_ramp || g_ramp_off.load(std::memory_order_relaxed) == on) return;
+    g_ramp_off = on;
+    const uint32_t w = on ? g_ramp->repl : g_ramp->orig;
+    if (!g_ramp_module->WriteReadOnly(g_ramp->at, &w, 4)) LOGW("hooks", "swipe camera: camera ramp patch failed");
+}
+
 uint64_t StickVector(const uint8_t* self, int ix, int iy) {
     const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32);
     const float x = a[ix], y = a[iy];
@@ -854,19 +880,7 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
                  std::sqrt(rx * rx + ry * ry), dsr::input::TouchCameraTilt());
         if (first && len == 0.0f) g_probe_seen.erase(key);  // log it once it has a value
     }
-#if defined(__aarch64__)
-    // The camera getter main+0x68b704 (x) calls main+0x68b568, which calls this: follow the frame records to the
-    // getter's saved x19, its caller's object (the pad manipulator, which stores the result at +64).
-    if (ix == 18 && g_main_base && len > 1.0f && !g_cam_trap_on.load(std::memory_order_relaxed)) {
-        const uintptr_t f1 = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        const uintptr_t fa = *reinterpret_cast<const uintptr_t*>(f1);  // main+0x68b568's frame
-        if (fa > f1 && fa - f1 < 0x10000 && *reinterpret_cast<const uintptr_t*>(fa + 8) == g_main_base + 0x68b74c) {
-            const uintptr_t fb = *reinterpret_cast<const uintptr_t*>(fa);  // main+0x68b704's frame
-            if (fb > fa && fb - fa < 0x1000 && *reinterpret_cast<const uintptr_t*>(fb + 8) == g_main_base + 0x2b2220)
-                StartCamTrap(*reinterpret_cast<const uintptr_t*>(fb - 8) + 64);
-        }
-    }
-#endif
+    if (ix == 18) SetCameraProportional(dsr::input::TouchSwipeActive());
     if (ix == 18) {
         CamNote(6, x);
         CamNote(7, y);
@@ -880,6 +894,19 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
 }
 
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    for (const RampPatch& r : kRampPatches) {
+        if (strncmp(r.build_id, b.build_id, strlen(r.build_id))) continue;
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + r.at);
+        // fcmp s11, s0 / b.le / ldr s0, [x20, #312]
+        if (code[-1] != 0x1E202160 || code[0] != r.orig || code[1] != 0xBD413A80) {
+            LOGW("hooks", "swipe camera: camera ramp not found at main+0x%lx", (unsigned long)r.at);
+            continue;
+        }
+        g_ramp_module = &rt.main;
+        g_ramp = &r;
+        LOGI("hooks", "swipe camera: the camera's turn ramp is skipped while swiping (main+0x%lx)", (unsigned long)r.at);
+    }
+
     for (const StickVecHook& h : kStickVecHooks) {
         if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
         // ldr x8,[x0,#8] / ldr x8,[x8,#0x20] / ldr s10,[x8,w1,sxtw #2] within the first 8 instructions

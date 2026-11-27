@@ -24,6 +24,9 @@ void SetPad(const PadState& s);
 void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry);
 // Length of the touch right stick (0 when not touched); past 1 only from the swipe camera.
 float TouchCameraTilt();
+// touch_camera_mode = swipe; true while it is (the touch right stick is non-zero in that mode).
+void SetTouchSwipe(bool on);
+bool TouchSwipeActive();
 // HLE side: snapshot plus a monotonically increasing sampling number.
 PadState GetPad(int64_t* sampling_number);
 

@@ -38,6 +38,13 @@ void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry) {
     g_touch_rx = rx;
     g_touch_ry = ry;
 }
+std::atomic<bool> g_touch_swipe{false};
+void SetTouchSwipe(bool on) { g_touch_swipe = on; }
+bool TouchSwipeActive() {
+    if (!g_touch_swipe.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_touch_rx != 0.0f || g_touch_ry != 0.0f;
+}
 float TouchCameraTilt() {
     std::lock_guard<std::mutex> lk(g_mutex);
     return std::sqrt(g_touch_rx * g_touch_rx + g_touch_ry * g_touch_ry);

@@ -560,6 +560,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 g_touch.camera_speed = sp >= 0.1f && sp <= 10.0f ? sp : 1.0f;
             } else if (!strcmp(key, "touch_camera_invert")) {
                 g_touch.camera_invert = v != 0;
+            } else if (!strcmp(key, "touch_camera_mode")) {
+                dsr::input::SetTouchSwipe(!strcmp(value, "swipe"));
             } else if (!strcmp(key, "bc_enabler")) {
                 cfg->bc_enabler = v != 0;
                 have_bc_enabler = true;
@@ -1106,6 +1108,9 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
         now = true;
     } else if (key == "touch_camera_invert") {
         g_touch.camera_invert = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "touch_camera_mode") {
+        dsr::input::SetTouchSwipe(value == "swipe");
         now = true;
     } else if (key == "touch_controls") {  // the overlay itself is changed by the menu (Java)
         g_touch.enabled = atoi(value.c_str()) != 0;
