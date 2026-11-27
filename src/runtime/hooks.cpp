@@ -3,6 +3,7 @@
 // version with different programs). They replace engine functions whose output is useful to us but goes
 // nowhere in a retail build, and patch the frame rate and resolution. The places were found in 1.0.0 and matched
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
+#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -229,6 +230,72 @@ void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
         }
     }
     LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
+}
+
+// Diagnostics (swipe camera, direct camera control): which game code reads the right stick. The pad class's analog
+// getter (1.0.0 main+0x81a5dc: index 3..8 -> float at this+0x468 + 4 * (index - 3); 3/4 the right stick X/Y, 5/6
+// the left stick) is replaced by the same lookup that also logs each new caller (and its caller) of the stick
+// channels, the first 48. The camera code that turns the stick into a turn is among them.
+struct PadProbe {
+    const char* build_id;
+    uint64_t getter;
+};
+const PadProbe kPadProbes[] = {
+    {"5a797a3a", 0x81a5dc},
+    {"6569410c", 0x8130cc},
+    {"df3766a2", 0x815aa0},
+};
+uint32_t g_pad_analog_base = 0x468;
+uintptr_t g_main_base = 0, g_main_end = 0;
+std::mutex g_probe_mutex;
+std::unordered_set<uint64_t> g_probe_seen;
+
+float PadAnalogProbe(const uint8_t* self, int index) {
+    const unsigned i = unsigned(index - 3);
+    const float v = i <= 5 ? *reinterpret_cast<const float*>(self + g_pad_analog_base + 4 * i) : 0.0f;
+    if (index >= 3 && index <= 6) {
+        const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        const uint64_t key = (uint64_t(ret) << 4) | uint64_t(index);
+        std::lock_guard<std::mutex> lk(g_probe_mutex);
+        if (g_probe_seen.size() < 48 && g_probe_seen.insert(key).second) {
+            // The caller's frame record (saved x29) gives its caller, when the code keeps frame pointers.
+            uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+            uintptr_t caller_fp = fp ? *reinterpret_cast<const uintptr_t*>(fp) : 0;
+            // Only a frame pointer close above ours on this stack is followed (x29 may hold anything otherwise).
+            uintptr_t ret2 = 0;
+            if (caller_fp > fp && caller_fp - fp < (1u << 20) && caller_fp % 16 == 0)
+                ret2 = *reinterpret_cast<const uintptr_t*>(caller_fp + 8);
+            auto off = [](uintptr_t a) -> long {
+                return a >= g_main_base && a < g_main_end ? long(a - g_main_base) : -1;
+            };
+            LOGI("hooks", "pad probe: %s read (now %.3f) from main+0x%lx (from main+0x%lx)",
+                 index == 3 ? "right stick X" : index == 4 ? "right stick Y" : index == 5 ? "left stick X" : "left stick Y",
+                 v, off(ret), off(ret2));
+        }
+    }
+    return v;
+}
+
+static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    const PadProbe* p = nullptr;
+    for (const PadProbe& c : kPadProbes)
+        if (!strncmp(c.build_id, b.build_id, strlen(c.build_id))) p = &c;
+    if (!p) return;
+    // The getter, as in every build: sub w8,w1,#3 / cmp w8,#5 / b.hi / add x8,x0,w8,sxtw #2 / ldr s0,[x8,#base]
+    const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + p->getter);
+    if (code[0] != 0x51000C28 || code[1] != 0x7100151F || (code[4] & 0xFFC003FF) != 0xBD400100) {
+        LOGW("hooks", "pad probe: getter not found at main+0x%lx", (unsigned long)p->getter);
+        return;
+    }
+    g_pad_analog_base = ((code[4] >> 10) & 0xFFF) * 4;
+    g_main_base = rt.main.base();
+    g_main_end = g_main_base + 0x8000000;
+    std::string err;
+    if (rt.main.HookFunction(p->getter, reinterpret_cast<void*>(&PadAnalogProbe), &err))
+        LOGI("hooks", "pad probe: logging which code reads the sticks (getter main+0x%lx, values at +0x%x)",
+             (unsigned long)p->getter, g_pad_analog_base);
+    else
+        LOGW("hooks", "pad probe not installed: %s", err.c_str());
 }
 
 // The engine's screen size block (1.0.0 main+0x1aeba90, 0x200 past GameBuild::shadow_size in every build):
@@ -790,6 +857,7 @@ void InstallGameHooks() {
         else
             LOGW("hooks", "dynamic buffer size not changed (%s)", err.c_str());
     }
+    InstallCameraInputProbe(rt, b);
     const Hook hooks[] = {
         {b.log, reinterpret_cast<void*>(&EngineLog), "engine log"},
         {b.vlog, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},
