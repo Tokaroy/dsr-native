@@ -380,8 +380,39 @@ std::atomic<uint32_t> g_trap_faults{0}, g_trap_camera{0};
 uint64_t g_trap_seen[48];
 std::atomic<uint64_t> g_trap_pending[48];  // array << 63 | index << 56 | pc offset << 28 | lr offset
 
+// Camera trap: the page holding the camera input the player's pad manipulator stores (its object +64: turn x, y;
+// stored at df37 main+0x2b223c from the camera getters main+0x68b704 / 0x68b764), to find the code that turns the
+// camera by it. Same scheme; only accesses to those 8 bytes are recorded.
+std::atomic<uintptr_t> g_cam_trap_lo{0}, g_cam_trap_at{0};
+std::atomic<bool> g_cam_trap_on{false}, g_trap_handler{false};
+std::atomic<int> g_cam_trap_count{0};
+std::atomic<uint32_t> g_cam_trap_faults{0}, g_cam_trap_hits{0};
+uint64_t g_cam_trap_seen[32];
+std::atomic<uint64_t> g_cam_trap_pending[32];  // offset << 56 | pc offset << 28 | lr offset
+
 void TrapHandler(int sig, siginfo_t* si, void* ctx) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
+    if (const uintptr_t lo = g_cam_trap_lo.load(std::memory_order_relaxed);
+        lo && a >= lo && a < lo + g_trap_page_size) {
+        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
+        g_cam_trap_faults.fetch_add(1, std::memory_order_relaxed);
+        const uintptr_t at = g_cam_trap_at.load(std::memory_order_relaxed);
+        auto* uc = static_cast<ucontext_t*>(ctx);
+        if (a < at || a >= at + 8 || uc->uc_mcontext.pc < g_main_base || uc->uc_mcontext.pc >= g_main_end) return;
+        g_cam_trap_hits.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t pc = (uc->uc_mcontext.pc - g_main_base) & 0x0FFFFFFF;
+        const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
+        const uint64_t key = (uint64_t(a - at) << 56) | (pc << 28) | lr;
+        const int n = g_cam_trap_count.load(std::memory_order_relaxed);
+        bool seen = false;
+        for (int i = 0; i < n && i < 32; i++) seen |= g_cam_trap_seen[i] == key;
+        if (!seen && n < 32) {
+            g_cam_trap_seen[n] = key;
+            g_cam_trap_pending[n].store(key, std::memory_order_relaxed);
+            g_cam_trap_count.store(n + 1, std::memory_order_release);
+        }
+        return;
+    }
     for (int w = 0; w < 2; w++) {
         const uintptr_t lo = g_trap[w].lo.load(std::memory_order_relaxed);
         if (!lo || a < lo || a >= lo + g_trap_page_size) continue;
@@ -413,6 +444,43 @@ void TrapHandler(int sig, siginfo_t* si, void* ctx) {
         signal(sig, SIG_DFL);
         raise(sig);
     }
+}
+
+void StartCamTrap(uintptr_t at) {
+    bool expected = false;
+    if (!g_cam_trap_on.compare_exchange_strong(expected, true)) return;
+    g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
+    const uintptr_t lo = at & ~uintptr_t(g_trap_page_size - 1);
+    g_cam_trap_at = at;
+    LOGI("hooks", "camera trap: watching the camera input at %p (page %p)", reinterpret_cast<void*>(at),
+         reinterpret_cast<void*>(lo));
+    struct sigaction sa {};
+    sa.sa_sigaction = TrapHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    if (!g_trap_handler.exchange(true)) sigaction(SIGSEGV, &sa, &g_trap_old);
+    std::thread([lo] {
+        int logged = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        g_cam_trap_lo = lo;
+        while (std::chrono::steady_clock::now() < end) {
+            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            const int n = g_cam_trap_count.load(std::memory_order_acquire);
+            for (; logged < n; logged++) {
+                const uint64_t v = g_cam_trap_pending[logged].load(std::memory_order_relaxed);
+                LOGI("hooks", "camera trap: +%d of the camera input accessed at main+0x%llx (return main+0x%llx)",
+                     64 + int(v >> 56), (unsigned long long)((v >> 28) & 0x0FFFFFFF),
+                     (unsigned long long)(v & 0x0FFFFFFF));
+            }
+        }
+        g_cam_trap_lo = 0;
+        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
+        LOGI("hooks", "camera trap: done, %d accessors (%u faults, %u on the camera input)", g_cam_trap_count.load(),
+             g_cam_trap_faults.load(), g_cam_trap_hits.load());
+    }).detach();
 }
 
 // Our own hooks touch the trapped pages first every frame (the action setter, the stick vector), which opened them
@@ -456,7 +524,7 @@ void StartReadTrap(uint8_t* input) {
     sa.sa_sigaction = TrapHandler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &g_trap_old);
+    if (!g_trap_handler.exchange(true)) sigaction(SIGSEGV, &sa, &g_trap_old);
     std::thread([] {
         int logged = 0, fails = 0;
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -622,6 +690,19 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
                  std::sqrt(rx * rx + ry * ry), dsr::input::TouchCameraTilt());
         if (first && len == 0.0f) g_probe_seen.erase(key);  // log it once it has a value
     }
+#if defined(__aarch64__)
+    // The camera getter main+0x68b704 (x) calls main+0x68b568, which calls this: follow the frame records to the
+    // getter's saved x19, its caller's object (the pad manipulator, which stores the result at +64).
+    if (ix == 18 && g_main_base && len > 1.0f && !g_cam_trap_on.load(std::memory_order_relaxed)) {
+        const uintptr_t f1 = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        const uintptr_t fa = *reinterpret_cast<const uintptr_t*>(f1);  // main+0x68b568's frame
+        if (fa > f1 && fa - f1 < 0x10000 && *reinterpret_cast<const uintptr_t*>(fa + 8) == g_main_base + 0x68b74c) {
+            const uintptr_t fb = *reinterpret_cast<const uintptr_t*>(fa);  // main+0x68b704's frame
+            if (fb > fa && fb - fa < 0x1000 && *reinterpret_cast<const uintptr_t*>(fb + 8) == g_main_base + 0x2b2220)
+                StartCamTrap(*reinterpret_cast<const uintptr_t*>(fb - 8) + 64);
+        }
+    }
+#endif
     if (ix == 18) {
         CamNote(6, x);
         CamNote(7, y);
