@@ -321,6 +321,33 @@ void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zon
     if (*max >= 0.99f && *max <= 1.01f) *max = 4.0f;
 }
 
+// The action mapping (df37 main+0x81c848, used by main+0x82ffa8): after the channels, each action's frame value gets
+// a dead zone and a scale and is clamped to +-max per action (28-byte entries: +0 action, +4 paired action, +8, +12,
+// +16 scale, +20 max, +24 dead zone; max goes out through the stack argument). That per-axis clamp to 1 is what held
+// the camera's actions (both axes at 1, length 1.41, with the touch at 2.69). Replaced by the same code that lets a max
+// of 1 go to 4 while the touch swipe camera is past full tilt, so nothing else changes.
+struct ActionMapHook {
+    const char* build_id;
+    uint64_t fn;
+};
+const ActionMapHook kActionMapHooks[] = {
+    {"5a797a3a", 0x821218},
+    {"6569410c", 0x8199d0},
+    {"df3766a2", 0x81c848},
+};
+void ActionMapEntry(const uint8_t* self, int i, uint32_t* action, uint32_t* pair, uint32_t* f8, uint32_t* f12,
+                    uint32_t* f24, float* scale, float* max) {
+    const uint8_t* e = *reinterpret_cast<const uint8_t* const*>(self + 8) + int64_t(i) * 0x1c;
+    memcpy(action, e + 0, 4);
+    memcpy(pair, e + 4, 4);
+    memcpy(f8, e + 8, 4);
+    memcpy(f12, e + 12, 4);
+    memcpy(scale, e + 16, 4);
+    memcpy(max, e + 20, 4);
+    memcpy(f24, e + 24, 4);
+    if (*max >= 0.99f && *max <= 1.01f && dsr::input::TouchCameraTilt() > 1.0f) *max = 4.0f;
+}
+
 // The input layer's action setter (df37 main+0x82c900): each device channel that drives a user action passes its value
 // here; the action keeps its largest positive and its most negative value of the frame (+208, +248) and their sum
 // (+328), which is later copied to the array the game reads (+32). Replaced by the same code that logs, once per
@@ -683,6 +710,20 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
             LOGI("hooks", "input mapping: channels allowed past full tilt (only the touch swipe camera sends more)");
         else
             LOGW("hooks", "input mapping hook failed: %s", err.c_str());
+    }
+
+    for (const ActionMapHook& h : kActionMapHooks) {
+        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+        // ldr x9,[x0,#8] / orr w10,wzr,#0x1c / smull x11,w1,w10 / ldr w9,[x9,x11] / str w9,[x2] ... ldr x8,[sp] (+0x5c)
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
+        std::string err;
+        if (code[0] != 0xF9400409 || code[1] != 0x321E0BEA || code[2] != 0x9B2A7C2B || code[23] != 0xF94003E8 ||
+            code[30] != 0xD65F03C0)
+            LOGW("hooks", "action mapping getter not found at main+0x%lx", (unsigned long)h.fn);
+        else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&ActionMapEntry), &err))
+            LOGI("hooks", "action mapping: actions allowed past full tilt while the swipe camera is");
+        else
+            LOGW("hooks", "action mapping hook failed: %s", err.c_str());
     }
 
     const PadProbe* p = nullptr;
