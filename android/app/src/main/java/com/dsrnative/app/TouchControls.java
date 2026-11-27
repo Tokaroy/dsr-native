@@ -399,10 +399,15 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // Swipe camera (sSwipe): the game only has a stick, so the thumb's speed becomes the stick's tilt. Movement is
     // gathered between display frames, turned into a speed (smoothed over a few frames: touch events and display
     // frames do not line up), and full tilt is reached at SWIPE_FULL_DP_S dp per second (divided by the camera
-    // speed setting). The game ignores small tilts (its own dead zone), so any movement starts at SWIPE_MIN_TILT:
-    // a slow drag still turns the camera slowly instead of not at all. When the thumb stops the tilt falls to zero
-    // within a few frames, so the camera stops with it.
-    private static final float SWIPE_FULL_DP_S = 1100f, SWIPE_MIN_TILT = 0.12f, SWIPE_SMOOTH_S = 0.025f;
+    // speed setting), through a curve that favours the lower half (SWIPE_CURVE). The game ignores small tilts
+    // (its own dead zone, and its camera turns slowly near it), so any movement starts at SWIPE_MIN_TILT: a slow
+    // drag still turns the camera. When the thumb stops the tilt falls to zero within a few frames.
+    // A swipe faster than full tilt can follow would be cut short (the game caps its turn rate): what the cap cut
+    // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
+    // a fast flick still turns the camera about as far as the thumb went.
+    private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.30f, SWIPE_CURVE = 0.7f,
+            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0.35f;
+    private float mSwipeDebtX, mSwipeDebtY;  // full-tilt seconds the cap cut off, per axis (signed)
     private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
     private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
     private float mSwipeRX, mSwipeRY;      // the tilt sent to the game
@@ -417,16 +422,41 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mSwipeVelY += (mSwipeAccY / dt - mSwipeVelY) * k;
             mSwipeAccX = mSwipeAccY = 0;
             float full = SWIPE_FULL_DP_S * mDensity / mCameraSpeed;
-            float rx = mSwipeVelX / full, ry = -mSwipeVelY / full;
-            float len = (float) Math.sqrt(rx * rx + ry * ry);
+            float wx = mSwipeVelX / full, wy = -mSwipeVelY / full;  // wanted tilt, may be past 1
+            float len = (float) Math.sqrt(wx * wx + wy * wy);
+            float rx = 0, ry = 0;
             if (len < 0.01f) {
-                rx = ry = 0;
                 mSwipeVelX = mSwipeVelY = 0;
             } else {
                 // Lift past the game's dead zone, keep the direction, cap at full tilt.
-                float t = Math.min(1f, SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * len);
-                rx = rx / len * t;
-                ry = ry / len * t;
+                float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
+                float t = Math.min(1f, SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve);
+                rx = wx / len * t;
+                ry = wy / len * t;
+                if (len > 1f) {  // past full tilt: keep what the cap cuts off
+                    mSwipeDebtX += (wx - wx / len) * dt;
+                    mSwipeDebtY += (wy - wy / len) * dt;
+                    float d = (float) Math.sqrt(mSwipeDebtX * mSwipeDebtX + mSwipeDebtY * mSwipeDebtY);
+                    if (d > SWIPE_DEBT_MAX_S) {
+                        mSwipeDebtX *= SWIPE_DEBT_MAX_S / d;
+                        mSwipeDebtY *= SWIPE_DEBT_MAX_S / d;
+                    }
+                }
+            }
+            // Pay the debt back at full tilt while the thumb is slower than that (or lifted). A swipe the other way
+            // cancels it.
+            if (mSwipeDebtX != 0 || mSwipeDebtY != 0) {
+                if (rx * mSwipeDebtX + ry * mSwipeDebtY < 0) {
+                    mSwipeDebtX = mSwipeDebtY = 0;
+                } else if (len <= 1f) {
+                    float d = (float) Math.sqrt(mSwipeDebtX * mSwipeDebtX + mSwipeDebtY * mSwipeDebtY);
+                    float pay = Math.min(d, dt);
+                    rx = mSwipeDebtX / d;
+                    ry = mSwipeDebtY / d;
+                    mSwipeDebtX -= rx * pay;
+                    mSwipeDebtY -= ry * pay;
+                    if (pay >= d) mSwipeDebtX = mSwipeDebtY = 0;
+                }
             }
             if (rx != mSwipeRX || ry != mSwipeRY) {
                 mSwipeRX = rx;
@@ -559,6 +589,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mStickPointer = -1;
         mRStickPointer = -1;
         mSwipeAccX = mSwipeAccY = mSwipeVelX = mSwipeVelY = mSwipeRX = mSwipeRY = 0;
+        mSwipeDebtX = mSwipeDebtY = 0;
         sendState();
     }
 
@@ -1038,6 +1069,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mRBaseY = mRY = y;
             if (sSwipe) {
                 mSwipeAccX = mSwipeAccY = 0;
+                mSwipeDebtX = mSwipeDebtY = 0;
                 android.view.Choreographer.getInstance().removeFrameCallback(mSwipeFrame);
                 android.view.Choreographer.getInstance().postFrameCallback(mSwipeFrame);
                 return;
