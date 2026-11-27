@@ -847,13 +847,18 @@ struct RampPatch {
     uint32_t orig, repl;  // b.le <proportional> / b <proportional>
     uint64_t follow_at;
     uint32_t follow_orig, follow_repl;  // cbz w19, <past> / b <past>
+    uint64_t follow2_at;  // ldr q1, [x20, #208] -> b <past the pitch and yaw stores> (+44)
 };
+// The follow that the trap caught (df37 main+0xab3f8, pitch written at main+0xab410): in the normal camera the
+// angles are worked out from the camera's position to its target every frame, so the camera turns after the
+// character. Jumped over while swiping, like the first one.
+constexpr uint32_t kFollow2Orig = 0x3DC03681, kFollow2Repl = 0x1400000B;
 const RampPatch kRampPatches[] = {
-    {"5a797a3a", 0xae554, 0x5400020D, 0x14000010, 0xae41c, 0x340001B3, 0x1400000D},
-    {"6569410c", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E},
-    {"df3766a2", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E},
+    {"5a797a3a", 0xae554, 0x5400020D, 0x14000010, 0xae41c, 0x340001B3, 0x1400000D, 0xae094},
+    {"6569410c", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E, 0xab3f8},
+    {"df3766a2", 0xab8c8, 0x5400022D, 0x14000011, 0xab780, 0x340001D3, 0x1400000E, 0xab3f8},
 };
-bool g_follow_ok = false;
+bool g_follow_ok = false, g_follow2_ok = false;
 loader::Module* g_ramp_module = nullptr;
 const RampPatch* g_ramp = nullptr;
 std::atomic<bool> g_ramp_off{false};
@@ -865,6 +870,9 @@ void SetCameraProportional(bool on) {
     const uint32_t f = on ? g_ramp->follow_repl : g_ramp->follow_orig;
     if (g_follow_ok && !g_ramp_module->WriteReadOnly(g_ramp->follow_at, &f, 4))
         LOGW("hooks", "swipe camera: camera follow patch failed");
+    const uint32_t f2 = on ? kFollow2Repl : kFollow2Orig;
+    if (g_follow2_ok && !g_ramp_module->WriteReadOnly(g_ramp->follow2_at, &f2, 4))
+        LOGW("hooks", "swipe camera: camera follow patch 2 failed");
 }
 
 // Diagnostics (df37): the camera update gets the pad manipulator through main+0x2c5900 (called at main+0xaab50, the
@@ -934,7 +942,7 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
 }
 
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
-    if (!strncmp(b.build_id, "df3766a2", 8)) {  // camera angle trap (diagnostics)
+    if (kCameraDiagnostics && !strncmp(b.build_id, "df3766a2", 8)) {  // camera angle trap (diagnostics)
         // ldr x8,[x0,#72] / ldr x0,[x8,#648] / cbnz x0 / ldr x0,[x8,#120] / ret
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + 0x2c5900);
         std::string err;
@@ -960,6 +968,13 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
         const uint32_t* fc = reinterpret_cast<const uint32_t*>(rt.main.base() + r.follow_at);
         g_follow_ok = fc[0] == r.follow_orig && fc[1] == 0x3DC03680 && fc[2] == 0x3DC04281;
         if (!g_follow_ok) LOGW("hooks", "swipe camera: camera follow not found at main+0x%lx", (unsigned long)r.follow_at);
+        // ldr q1, [x20, #208] / fsub v0.4s, v1.4s, v0.4s / stur q0, [x29, #-192] / ldr s0, [x20, #320] ... str s0, [x20, #324]
+        const uint32_t* f2 = reinterpret_cast<const uint32_t*>(rt.main.base() + r.follow2_at);
+        g_follow2_ok = f2[0] == kFollow2Orig && f2[1] == 0x4EA0D420 && f2[3] == 0xBD414280 && f2[10] == 0xBD014680;
+        if (!g_follow2_ok)
+            LOGW("hooks", "swipe camera: camera follow 2 not found at main+0x%lx", (unsigned long)r.follow2_at);
+        else
+            LOGI("hooks", "swipe camera: the camera does not follow the character while swiping");
         LOGI("hooks", "swipe camera: the camera's turn ramp is skipped while swiping (main+0x%lx)", (unsigned long)r.at);
     }
 
