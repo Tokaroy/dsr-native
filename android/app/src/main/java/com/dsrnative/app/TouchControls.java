@@ -50,6 +50,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private static TouchControls sView;
     /** settings.txt touch_camera_recenter: a thumb resting on the camera stick brings it back to the centre. */
     static volatile boolean sRecenter = true;
+    /**
+     * settings.txt touch_camera_mode = swipe: the right side of the screen turns the camera the way a mobile game
+     * does, by how fast the thumb moves (no stick: the camera stops when the thumb stops). stick (default): the
+     * floating camera stick.
+     */
+    static volatile boolean sSwipe = false;
     /** Offsets of the groups from their default spots, in layout units (settings.txt touch_layout). */
     private static volatile Map<String, float[]> sLayout = new HashMap<>();
     /** Groups that can be moved, in settings.txt. */
@@ -390,6 +396,52 @@ public final class TouchControls extends View implements InputManager.InputDevic
     };
     private float mCameraSpeed;
 
+    // Swipe camera (sSwipe): the game only has a stick, so the thumb's speed becomes the stick's tilt. Movement is
+    // gathered between display frames, turned into a speed (smoothed over a few frames: touch events and display
+    // frames do not line up), and full tilt is reached at SWIPE_FULL_DP_S dp per second (divided by the camera
+    // speed setting). The game ignores small tilts (its own dead zone), so any movement starts at SWIPE_MIN_TILT:
+    // a slow drag still turns the camera slowly instead of not at all. When the thumb stops the tilt falls to zero
+    // within a few frames, so the camera stops with it.
+    private static final float SWIPE_FULL_DP_S = 1100f, SWIPE_MIN_TILT = 0.12f, SWIPE_SMOOTH_S = 0.025f;
+    private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
+    private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
+    private float mSwipeRX, mSwipeRY;      // the tilt sent to the game
+    private long mSwipeLastNs;
+    private final android.view.Choreographer.FrameCallback mSwipeFrame = new android.view.Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameNs) {
+            float dt = mSwipeLastNs == 0 ? 0.016f : Math.max(0.004f, Math.min(0.05f, (frameNs - mSwipeLastNs) / 1e9f));
+            mSwipeLastNs = frameNs;
+            float k = 1f - (float) Math.exp(-dt / SWIPE_SMOOTH_S);
+            mSwipeVelX += (mSwipeAccX / dt - mSwipeVelX) * k;
+            mSwipeVelY += (mSwipeAccY / dt - mSwipeVelY) * k;
+            mSwipeAccX = mSwipeAccY = 0;
+            float full = SWIPE_FULL_DP_S * mDensity / mCameraSpeed;
+            float rx = mSwipeVelX / full, ry = -mSwipeVelY / full;
+            float len = (float) Math.sqrt(rx * rx + ry * ry);
+            if (len < 0.01f) {
+                rx = ry = 0;
+                mSwipeVelX = mSwipeVelY = 0;
+            } else {
+                // Lift past the game's dead zone, keep the direction, cap at full tilt.
+                float t = Math.min(1f, SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * len);
+                rx = rx / len * t;
+                ry = ry / len * t;
+            }
+            if (rx != mSwipeRX || ry != mSwipeRY) {
+                mSwipeRX = rx;
+                mSwipeRY = ry;
+                sendState();
+            }
+            // Runs while the thumb is down and until the camera has stopped.
+            if (mRStickPointer >= 0 || rx != 0 || ry != 0) {
+                android.view.Choreographer.getInstance().postFrameCallback(this);
+            } else {
+                mSwipeLastNs = 0;
+            }
+        }
+    };
+
     // Double tap (to show the controls again).
     private long mLastTapTime;
     private float mLastTapX, mLastTapY;
@@ -506,6 +558,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         for (Button b : mButtons) b.pressCount = 0;
         mStickPointer = -1;
         mRStickPointer = -1;
+        mSwipeAccX = mSwipeAccY = mSwipeVelX = mSwipeVelY = mSwipeRX = mSwipeRY = 0;
         sendState();
     }
 
@@ -983,6 +1036,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mRStickPointer = id;
             mRBaseX = mRX = x;
             mRBaseY = mRY = y;
+            if (sSwipe) {
+                mSwipeAccX = mSwipeAccY = 0;
+                android.view.Choreographer.getInstance().removeFrameCallback(mSwipeFrame);
+                android.view.Choreographer.getInstance().postFrameCallback(mSwipeFrame);
+                return;
+            }
             mRLastMove = android.os.SystemClock.uptimeMillis();
             mRLastFrameNs = 0;
             android.view.Choreographer.getInstance().removeFrameCallback(mRecenter);
@@ -1014,6 +1073,13 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 mStickY = y;
                 break;
             case K_RSTICK: {
+                if (sSwipe) {
+                    mSwipeAccX += x - mRX;
+                    mSwipeAccY += y - mRY;
+                    mRX = x;
+                    mRY = y;
+                    break;
+                }
                 if (x != mRX || y != mRY) mRLastMove = android.os.SystemClock.uptimeMillis();
                 mRX = x;
                 mRY = y;
@@ -1057,7 +1123,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (Math.abs(lx) < 0.08f && Math.abs(ly) < 0.08f) lx = ly = 0;
         }
         float rx = 0, ry = 0;
-        if (mRStickPointer >= 0) {
+        if (sSwipe) {
+            rx = mSwipeRX;
+            ry = mSwipeRY;
+        } else if (mRStickPointer >= 0) {
             // Full tilt at 1 / speed of the ring's radius (speed 1: at the edge).
             float reach = mRRadius / mCameraSpeed;
             rx = Math.max(-1f, Math.min(1f, (mRX - mRBaseX) / reach));
@@ -1123,8 +1192,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
             c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
         }
-        // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is).
-        if (mRStickPointer >= 0) {
+        // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is). Nothing is
+        // drawn for the swipe camera.
+        if (mRStickPointer >= 0 && !sSwipe) {
             final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
             // A skin's camera ring is an image of its own: shown at 40% (the plain one, a faint outline, at 10%).
             final int sa = Math.max(1, Math.min(255, Math.round(255 * 0.40f / Math.max(0.1f, getAlpha()))));

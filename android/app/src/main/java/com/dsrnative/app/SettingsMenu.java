@@ -97,6 +97,7 @@ public final class SettingsMenu {
         Map<String, String> v = readSettings();
         Strings.setLanguage(v.containsKey("language") ? v.get("language") : "en-US");
         TouchControls.sRecenter = !"0".equals(v.get("touch_camera_recenter"));
+        TouchControls.sSwipe = "swipe".equals(v.get("touch_camera_mode"));
         TouchControls.setLayout(v.get("touch_layout"));
         TouchControls.prepareSkinsDir(settingsPath);
         TouchControls.setSkin(activity, v.get("touch_skin"), settingsPath);
@@ -882,6 +883,8 @@ public final class SettingsMenu {
                 TouchControls.SKIN_DEFAULT);
         choice("touch_opacity", Strings.t("opacity_t"), null, new String[] {"0.3", "0.5", "0.7", "1.0"},
                 new String[] {"30%", "50%", "70%", "100%"}, "0.7");
+        choice("touch_camera_mode", Strings.t("cammode_t"), Strings.t("cammode_n"), new String[] {"stick", "swipe"},
+                new String[] {Strings.t("cammode_stick"), Strings.t("cammode_swipe")}, "stick");
         choice("touch_camera_speed", Strings.t("camspeed_t"), null, new String[] {"0.75", "1.0", "1.5", "2.0"},
                 new String[] {Strings.t("speed_slow"), Strings.t("speed_normal"), Strings.t("speed_fast"),
                         Strings.t("speed_faster")}, "1.0");
@@ -1546,6 +1549,9 @@ public final class SettingsMenu {
             now = true;
         } else if (key.equals("touch_camera_recenter")) {
             TouchControls.sRecenter = !"0".equals(value);
+            now = true;
+        } else if (key.equals("touch_camera_mode")) {
+            TouchControls.sSwipe = "swipe".equals(value);
             now = true;
         } else if (key.startsWith("touch_") && !key.equals("touch_camera_invert")) {
             boolean on = !"0".equals(mValues.get("touch_controls"));

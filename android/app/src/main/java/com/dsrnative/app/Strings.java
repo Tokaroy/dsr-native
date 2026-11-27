@@ -663,6 +663,25 @@ final class Strings {
                 "Показывать сенсорное управление", "タッチ操作を表示", "터치 조작 표시", "显示触控操作", "顯示觸控操作");
         put("opacity_t", "Opacity", "Opacité", "Deckkraft", "Opacità", "Opacidad", "Opacidade", "Непрозрачность",
                 "不透明度", "불투명도", "不透明度", "不透明度");
+        put("cammode_t", "Camera control", "Contrôle de la caméra", "Kamerasteuerung", "Controllo della telecamera",
+                "Control de la cámara", "Controle da câmera", "Управление камерой", "カメラ操作", "카메라 조작", "视角控制",
+                "視角控制");
+        put("cammode_stick", "Stick", "Stick", "Stick", "Stick", "Stick", "Analógico", "Стик", "スティック", "스틱", "摇杆",
+                "搖桿");
+        put("cammode_swipe", "Swipe", "Glisser", "Wischen", "Scorrimento", "Deslizar", "Deslizar", "Свайп", "スワイプ",
+                "스와이프", "滑动", "滑動");
+        put("cammode_n",
+                "Swipe: drag on the right side of the screen and the camera follows your thumb, faster the faster you move; it stops when your thumb stops. Stick: a floating camera stick appears where you touch.",
+                "Glisser : faites glisser le pouce sur la droite de l'écran, la caméra le suit, d'autant plus vite que vous allez vite ; elle s'arrête quand le pouce s'arrête. Stick : un stick caméra apparaît là où vous touchez.",
+                "Wischen: Auf der rechten Bildschirmseite ziehen, die Kamera folgt dem Daumen, je schneller, desto schneller; sie hält an, wenn der Daumen anhält. Stick: Ein Kamerastick erscheint dort, wo du tippst.",
+                "Scorrimento: trascina sul lato destro dello schermo e la telecamera segue il pollice, più veloce quanto più ti muovi veloce; si ferma quando il pollice si ferma. Stick: uno stick della telecamera appare dove tocchi.",
+                "Deslizar: arrastra en el lado derecho de la pantalla y la cámara sigue al pulgar, más rápido cuanto más rápido lo muevas; se detiene cuando el pulgar se detiene. Stick: aparece un stick de cámara donde tocas.",
+                "Deslizar: arraste no lado direito da tela e a câmera segue o polegar, mais rápido quanto mais rápido você mover; ela para quando o polegar para. Analógico: um analógico de câmera aparece onde você toca.",
+                "Свайп: ведите пальцем по правой части экрана, и камера следует за ним, тем быстрее, чем быстрее движение; она останавливается вместе с пальцем. Стик: стик камеры появляется там, где вы коснулись.",
+                "スワイプ：画面の右側をなぞるとカメラが親指に合わせて動き、速く動かすほど速く回ります。親指を止めるとカメラも止まります。スティック：触れた場所にカメラスティックが現れます。",
+                "스와이프: 화면 오른쪽을 드래그하면 카메라가 엄지를 따라가며, 빠르게 움직일수록 빠르게 돕니다. 엄지를 멈추면 카메라도 멈춥니다. 스틱: 터치한 곳에 카메라 스틱이 나타납니다.",
+                "滑动：在屏幕右侧拖动，视角跟随拇指移动，移动越快转得越快；拇指停下视角也停下。摇杆：在触摸处出现视角摇杆。",
+                "滑動：在螢幕右側拖曳，視角跟隨拇指移動，移動越快轉得越快；拇指停下視角也停下。搖桿：在觸碰處出現視角搖桿。");
         put("camspeed_t", "Camera stick speed", "Vitesse du stick caméra", "Tempo des Kamerasticks",
                 "Velocità dello stick della telecamera", "Velocidad del stick de cámara",
                 "Velocidade do analógico da câmera", "Скорость стика камеры", "カメラスティックの速さ", "카메라 스틱 속도",

@@ -381,7 +381,8 @@ std::string g_custom_game_dir;  // settings.txt `game_dir`: a game folder the pl
     "# right stick press); touch the right side anywhere else for a camera stick that follows your finger.\n"  \
     "# They hide when a controller is connected or used; double-tap the screen to bring them back.\n"         \
     "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: how far the camera\n"   \
-    "# stick moves for a full turn (1 = to its edge, 2 = half that). touch_camera_invert: 1 = up looks down.\n"
+    "# stick moves for a full turn (1 = to its edge, 2 = half that). touch_camera_invert: 1 = up looks down.\n" \
+    "# touch_camera_mode: stick, or swipe (the camera follows the thumb's movement and stops when it stops).\n"
 #define TOUCH_DEFAULTS "touch_controls = 1\ntouch_opacity = 0.7\ntouch_camera_speed = 1.0\ntouch_camera_invert = 0\n"
 
 #define ASPECT_HELP                                                                                          \
