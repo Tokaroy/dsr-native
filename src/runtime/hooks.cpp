@@ -575,7 +575,7 @@ void TrapHandler(int sig, siginfo_t* si, void* ctx) {
                     g_cam_trap_count.store(n + 1, std::memory_order_release);
                 }
             }
-            done = TrapExecute(uc, t);
+            (void)TrapExecute;  // carrying the access out froze the game: the page opens instead (re-armed often)
         }
         if (done && g_cam_trap_lo.load(std::memory_order_relaxed))
             mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
@@ -620,7 +620,7 @@ void StartCamTrap(uintptr_t at) {
     g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
     const uintptr_t lo = at & ~uintptr_t(g_trap_page_size - 1);
     g_cam_trap_at = at;
-    LOGI("hooks", "camera trap: watching the camera input at %p (page %p)", reinterpret_cast<void*>(at),
+    LOGI("hooks", "camera trap: watching the camera's angles at %p (page %p)", reinterpret_cast<void*>(at),
          reinterpret_cast<void*>(lo));
     struct sigaction sa {};
     sa.sa_sigaction = TrapHandler;
@@ -633,12 +633,12 @@ void StartCamTrap(uintptr_t at) {
         g_cam_trap_lo = lo;
         while (std::chrono::steady_clock::now() < end) {
             mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);  // after an access not carried out
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
             const int n = g_cam_trap_count.load(std::memory_order_acquire);
             for (; logged < n; logged++) {
                 const uint64_t v = g_cam_trap_pending[logged].load(std::memory_order_relaxed);
-                LOGI("hooks", "camera trap: +%d of the camera input %s at main+0x%llx (return main+0x%llx)",
-                     64 + int((v >> 56) & 0x7F), (v >> 55) & 1 ? "read" : "written",
+                LOGI("hooks", "camera trap: camera angle +%d %s at main+0x%llx (return main+0x%llx)",
+                     320 + int((v >> 56) & 0x7F), (v >> 55) & 1 ? "read" : "written",
                      (unsigned long long)((v >> 28) & 0x07FFFFFF),
                      (unsigned long long)(v & 0x0FFFFFFF));
             }
@@ -867,6 +867,32 @@ void SetCameraProportional(bool on) {
         LOGW("hooks", "swipe camera: camera follow patch failed");
 }
 
+// Diagnostics (df37): the camera update gets the pad manipulator through main+0x2c5900 (called at main+0xaab50, the
+// camera object in x20). Replaced by the same code through a stub that also passes x20 and the return address; the
+// first time it is called from the camera while swiping, the camera trap watches the camera's angles (+320 pitch,
+// +324 yaw) for 10 s to find the code that turns the camera after the character.
+extern "C" uint64_t DsrManipGetterImpl(const uint8_t* self, uintptr_t cam, uintptr_t lr) {
+    const uint8_t* o = *reinterpret_cast<const uint8_t* const*>(self + 72);
+    uint64_t r = *reinterpret_cast<const uint64_t*>(o + 648);
+    if (!r) r = *reinterpret_cast<const uint64_t*>(o + 120);
+#if defined(__aarch64__)
+    if (lr == g_main_base + 0xaab54 && cam && !g_cam_trap_on.load(std::memory_order_relaxed) &&
+        dsr::input::TouchSwipeActive())
+        StartCamTrap(cam + 320);
+#else
+    (void)cam;
+    (void)lr;
+#endif
+    return r;
+}
+extern "C" void DsrManipGetterStub();
+#if defined(__aarch64__)
+asm(".text\n.p2align 2\n.global DsrManipGetterStub\n.type DsrManipGetterStub, %function\nDsrManipGetterStub:\n"
+    "    mov x1, x20\n    mov x2, x30\n    b DsrManipGetterImpl\n");
+#else
+extern "C" void DsrManipGetterStub() {}
+#endif
+
 uint64_t StickVector(const uint8_t* self, int ix, int iy) {
     const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32);
     const float x = a[ix], y = a[iy];
@@ -908,6 +934,18 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
 }
 
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    if (!strncmp(b.build_id, "df3766a2", 8)) {  // camera angle trap (diagnostics)
+        // ldr x8,[x0,#72] / ldr x0,[x8,#648] / cbnz x0 / ldr x0,[x8,#120] / ret
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + 0x2c5900);
+        std::string err;
+        g_main_base = rt.main.base();
+        g_main_end = g_main_base + 0x8000000;
+        if (code[0] == 0xF9402408 && code[4] == 0xD65F03C0 &&
+            rt.main.HookFunction(0x2c5900, reinterpret_cast<void*>(&DsrManipGetterStub), &err))
+            LOGI("hooks", "camera trap: armed (starts on the first swipe)");
+        else
+            LOGW("hooks", "camera trap: manipulator getter not hooked %s", err.c_str());
+    }
     for (const RampPatch& r : kRampPatches) {
         if (strncmp(r.build_id, b.build_id, strlen(r.build_id))) continue;
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + r.at);
