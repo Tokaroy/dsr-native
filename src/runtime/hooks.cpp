@@ -253,24 +253,26 @@ std::unordered_set<uint64_t> g_probe_seen;
 float PadAnalogProbe(const uint8_t* self, int index) {
     const unsigned i = unsigned(index - 3);
     const float v = i <= 5 ? *reinterpret_cast<const float*>(self + g_pad_analog_base + 4 * i) : 0.0f;
-    if (index >= 3 && index <= 6) {
-        const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-        const uint64_t key = (uint64_t(ret) << 4) | uint64_t(index);
+    if (index == 3 || index == 4) {
+        // Every reader goes through the device set's "first device with a non-zero value" (main+0x816968 in df37),
+        // so the reader is its caller: followed through the frame records (x29), only while each one lies close
+        // above the previous on this stack (x29 may hold anything otherwise).
+        uintptr_t ret[4] = {reinterpret_cast<uintptr_t>(__builtin_return_address(0)), 0, 0, 0};
+        uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        for (int k = 1; k < 4 && fp; k++) {
+            const uintptr_t next = *reinterpret_cast<const uintptr_t*>(fp);
+            if (!(next > fp && next - fp < (1u << 20) && next % 16 == 0)) break;
+            fp = next;
+            ret[k] = *reinterpret_cast<const uintptr_t*>(fp + 8);
+        }
+        const uint64_t key = (uint64_t(ret[0]) * 31 + ret[1]) * 31 + ret[2] + uint64_t(index);
         std::lock_guard<std::mutex> lk(g_probe_mutex);
-        if (g_probe_seen.size() < 48 && g_probe_seen.insert(key).second) {
-            // The caller's frame record (saved x29) gives its caller, when the code keeps frame pointers.
-            uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-            uintptr_t caller_fp = fp ? *reinterpret_cast<const uintptr_t*>(fp) : 0;
-            // Only a frame pointer close above ours on this stack is followed (x29 may hold anything otherwise).
-            uintptr_t ret2 = 0;
-            if (caller_fp > fp && caller_fp - fp < (1u << 20) && caller_fp % 16 == 0)
-                ret2 = *reinterpret_cast<const uintptr_t*>(caller_fp + 8);
+        if (g_probe_seen.size() < 64 && g_probe_seen.insert(key).second) {
             auto off = [](uintptr_t a) -> long {
                 return a >= g_main_base && a < g_main_end ? long(a - g_main_base) : -1;
             };
-            LOGI("hooks", "pad probe: %s read (now %.3f) from main+0x%lx (from main+0x%lx)",
-                 index == 3 ? "right stick X" : index == 4 ? "right stick Y" : index == 5 ? "left stick X" : "left stick Y",
-                 v, off(ret), off(ret2));
+            LOGI("hooks", "pad probe: right stick %s read (now %.3f) from main+0x%lx <- 0x%lx <- 0x%lx <- 0x%lx",
+                 index == 3 ? "X" : "Y", v, off(ret[0]), off(ret[1]), off(ret[2]), off(ret[3]));
         }
     }
     return v;
