@@ -416,6 +416,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
     private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
     private float mSwipeRX, mSwipeRY;      // the tilt sent to the game
+    private float mSwipeDirX, mSwipeDirY;  // the last swipe direction (unit), for a held thumb
+    private static final float SWIPE_HOLD_TILT = 1e-3f;  // clear of the pad value rounding (1/32767)
     private long mSwipeLastNs;
     private final android.view.Choreographer.FrameCallback mSwipeFrame = new android.view.Choreographer.FrameCallback() {
         @Override
@@ -468,6 +470,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
                     mSwipeDebtY -= ry * pay;
                     if (pay >= d) mSwipeDebtX = mSwipeDebtY = 0;
                 }
+            }
+            // While the thumb is down the game must keep seeing camera input, as with a stick held: when the camera
+            // input is exactly zero the game lets its camera follow the character again (it swung back and forth
+            // between swipes while walking). A held, still thumb sends the smallest tilt past the game's dead zone in
+            // the last direction (the camera sees 1/1000 of full tilt: no visible turn).
+            if (rx != 0 || ry != 0) {
+                float l = (float) Math.sqrt(rx * rx + ry * ry);
+                mSwipeDirX = rx / l;
+                mSwipeDirY = ry / l;
+            } else if (mRStickPointer >= 0 && (mSwipeDirX != 0 || mSwipeDirY != 0)) {
+                float t = STICK_DEAD_ZONE + STICK_SCALE * SWIPE_HOLD_TILT;
+                rx = mSwipeDirX * t;
+                ry = mSwipeDirY * t;
             }
             if (rx != mSwipeRX || ry != mSwipeRY) {
                 mSwipeRX = rx;
@@ -1081,6 +1096,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (sSwipe) {
                 mSwipeAccX = mSwipeAccY = 0;
                 mSwipeDebtX = mSwipeDebtY = 0;
+                mSwipeDirX = mSwipeDirY = 0;
                 android.view.Choreographer.getInstance().removeFrameCallback(mSwipeFrame);
                 android.view.Choreographer.getInstance().postFrameCallback(mSwipeFrame);
                 return;
