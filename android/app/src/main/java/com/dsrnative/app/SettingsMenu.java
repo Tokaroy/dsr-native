@@ -95,6 +95,11 @@ public final class SettingsMenu {
         sGameDir = gameDir;
         sDefaultGameDir = defaultGameDir;
         Map<String, String> v = readSettings();
+        // Performance mode used to set the geometry cache to 64 MB, now 96 MB: a 64 it set (the value from before it
+        // is kept) becomes 96 from the next start.
+        if ("1".equals(v.get("performance_mode")) && "64".equals(v.get("geo_cache_mb"))
+                && v.get("geo_cache_mb_before_perf") != null && !v.get("geo_cache_mb_before_perf").isEmpty())
+            writeSetting("geo_cache_mb", "96");
         Strings.setLanguage(v.containsKey("language") ? v.get("language") : "en-US");
         TouchControls.sRecenter = !"0".equals(v.get("touch_camera_recenter"));
         TouchControls.sSwipe = !"stick".equals(v.get("touch_camera_mode"));  // swipe by default
@@ -515,19 +520,20 @@ public final class SettingsMenu {
                 "1", "0", "0");
 
         section(Strings.t("sec_quality"));
-        toggle("performance_mode", Strings.t("perf_t"), Strings.t("perf_n") + " " + Strings.t("changes_next"), "1", "0",
-                "0");
+        // Settings with several levels first, then the on / off ones together.
         renderScale();  // performance mode sets 75%; it can be moved freely afterwards
-        toggle("sharp_hud", Strings.t("sharp_t"), Strings.t("sharp_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         choice("fxaa", Strings.t("fxaa_t"), Strings.t("fxaa_n") + " " + Strings.t("changes_next"), new String[] {"0", "1", "2"},
                 new String[] {Strings.t("off"), Strings.t("fxaa_fast"), Strings.t("fxaa_quality")}, "0");
-        toggle("fsr", Strings.t("fsr_t"), Strings.t("fsr_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         choice("shadow_quality", Strings.t("shq_t"), Strings.t("shq_n") + " " + Strings.t("changes_next"),
                 new String[] {"0", "1", "2", "3"},
                 new String[] {Strings.t("shq_off"), Strings.t("shq_low"), Strings.t("shq_med"), Strings.t("shq_high")}, "3");
         choice("anisotropy", Strings.t("aniso_t"), Strings.t("aniso_n") + " " + Strings.t("changes_next"),
                 new String[] {"-1", "0", "2", "4", "8", "16"},
                 new String[] {Strings.t("aniso_game"), Strings.t("off"), "2x", "4x", "8x", "16x"}, "-1");
+        toggle("performance_mode", Strings.t("perf_t"), Strings.t("perf_n") + " " + Strings.t("changes_next"), "1", "0",
+                "0");
+        toggle("fsr", Strings.t("fsr_t"), Strings.t("fsr_n") + " " + Strings.t("changes_next"), "1", "0", "0");
+        toggle("sharp_hud", Strings.t("sharp_t"), Strings.t("sharp_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         toggle("lighter_post_fx", Strings.t("post_t"), Strings.t("post_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
 
@@ -539,6 +545,10 @@ public final class SettingsMenu {
                 "0");
         choice("geo_cache_mb", Strings.t("geo_t"), Strings.t("geo_n") + " " + Strings.t("changes_next"),
                 new String[] {"192", "128", "96", "64"}, new String[] {"192 MB", "128 MB", "96 MB", "64 MB"}, "192");
+        // Used by every GPU without BC textures (not only Mali): with the general GPU options.
+        choice("tex_cache_mb", Strings.t("texc_t"), Strings.t("texc_n") + " " + Strings.t("changes_next"),
+                new String[] {"512", "1024", "256", "0"},
+                new String[] {"512 MB", "1024 MB", "256 MB", Strings.t("off")}, "512");
         // Mali fixes: settings for GPUs such as Mali (no BC textures, tile-based), folded away by default.
         final int maliFirst = mBody.getChildCount() + 1;  // after the group's header row
         TextView maliHeader = subsection(Strings.t("sec_mali"));
@@ -550,9 +560,6 @@ public final class SettingsMenu {
         toggle("bc_astc", Strings.t("astc_t"), Strings.t("astc_n") + " " + Strings.t("changes_next"), "1", "0", "0");
         choice("astc_block", Strings.t("astcb_t"), Strings.t("astcb_n") + " " + Strings.t("changes_next"),
                 new String[] {"4", "6", "8"}, new String[] {Strings.t("astcb_4"), Strings.t("astcb_6"), Strings.t("astcb_8")}, "4");
-        choice("tex_cache_mb", Strings.t("texc_t"), Strings.t("texc_n") + " " + Strings.t("changes_next"),
-                new String[] {"512", "1024", "256", "0"},
-                new String[] {"512 MB", "1024 MB", "256 MB", Strings.t("off")}, "512");
         toggle("mali_barriers", Strings.t("malib_t"), Strings.t("malib_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         choice("skip_prepass", Strings.t("prepass_t"), Strings.t("prepass_n") + " " + Strings.t("prepass_alpha_n") + " "
@@ -1494,12 +1501,13 @@ public final class SettingsMenu {
                 }
             }
         }
-        // Performance mode also shrinks the geometry cache to 64 MB (less RAM for 4 GB phones); off puts back what it was.
+        // Performance mode also shrinks the geometry cache to 96 MB (less RAM for 4 GB phones; 64 MB re-copied geometry
+        // too often); off puts back what it was.
         if (on) {
             String was = mValues.containsKey("geo_cache_mb") ? mValues.get("geo_cache_mb") : "192";
             writeSetting("geo_cache_mb_before_perf", was);
             mValues.put("geo_cache_mb_before_perf", was);
-            if (writeSetting("geo_cache_mb", "64")) mValues.put("geo_cache_mb", "64");
+            if (writeSetting("geo_cache_mb", "96")) mValues.put("geo_cache_mb", "96");
         } else {
             String before = mValues.get("geo_cache_mb_before_perf");
             if (before != null && !before.isEmpty()) {
