@@ -406,7 +406,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // off is kept as a debt and paid back at full tilt once the thumb slows or lifts (at most SWIPE_DEBT_MAX_S), so
     // a fast flick still turns the camera about as far as the thumb went.
     private static final float SWIPE_FULL_DP_S = 450f, SWIPE_MIN_TILT = 0.30f, SWIPE_CURVE = 0.7f,
-            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f;  // carry-over off: it kept turning after the thumb lifted
+            SWIPE_SMOOTH_S = 0.025f, SWIPE_DEBT_MAX_S = 0f, SWIPE_MAX_TILT = 4f;  // carry-over off: it kept turning after the thumb lifted
     private float mSwipeDebtX, mSwipeDebtY;  // full-tilt seconds the cap cut off, per axis (signed)
     private float mSwipeAccX, mSwipeAccY;  // pixels moved since the last display frame
     private float mSwipeVelX, mSwipeVelY;  // smoothed, pixels per second
@@ -428,14 +428,16 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (len < 0.01f) {
                 mSwipeVelX = mSwipeVelY = 0;
             } else {
-                // Lift past the game's dead zone, keep the direction, cap at full tilt.
+                // Lift past the game's dead zone and keep the direction. Past full tilt the value goes on rising
+                // with the thumb's speed (up to SWIPE_MAX_TILT): the game's pad code does not cap it, so a fast
+                // flick may turn the camera faster than a stick can (native code lets touch go to 4x).
                 float curve = (float) Math.pow(Math.min(len, 1f), SWIPE_CURVE);
-                float t = Math.min(1f, SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve);
+                float t = len > 1f ? Math.min(len, SWIPE_MAX_TILT) : SWIPE_MIN_TILT + (1f - SWIPE_MIN_TILT) * curve;
                 rx = wx / len * t;
                 ry = wy / len * t;
-                if (len > 1f) {  // past full tilt: keep what the cap cuts off
-                    mSwipeDebtX += (wx - wx / len) * dt;
-                    mSwipeDebtY += (wy - wy / len) * dt;
+                if (len > SWIPE_MAX_TILT) {  // past the most we send: keep what is cut off
+                    mSwipeDebtX += (wx - wx / len * SWIPE_MAX_TILT) * dt;
+                    mSwipeDebtY += (wy - wy / len * SWIPE_MAX_TILT) * dt;
                     float d = (float) Math.sqrt(mSwipeDebtX * mSwipeDebtX + mSwipeDebtY * mSwipeDebtY);
                     if (d > SWIPE_DEBT_MAX_S) {
                         mSwipeDebtX *= SWIPE_DEBT_MAX_S / d;
@@ -448,7 +450,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (mSwipeDebtX != 0 || mSwipeDebtY != 0) {
                 if (rx * mSwipeDebtX + ry * mSwipeDebtY < 0) {
                     mSwipeDebtX = mSwipeDebtY = 0;
-                } else if (len <= 1f) {
+                } else if (len <= SWIPE_MAX_TILT) {
                     float d = (float) Math.sqrt(mSwipeDebtX * mSwipeDebtX + mSwipeDebtY * mSwipeDebtY);
                     float pay = Math.min(d, dt);
                     rx = mSwipeDebtX / d;
