@@ -246,14 +246,12 @@ int CreateUserFileImpl(const char* name, const char* mime_type) {
 tm g_log_time{};
 bool g_log_via_media_store = false;
 
-// After the settings are read (detailed_logs, see RuntimeConfig). Detailed: the logcat mirror is started (its file
-// named after the run log). Standard: Info-level logging, and old files in the logs folder are removed, keeping the
-// 10 newest starts' run logs, logcat files and shader dumps (frame captures are left alone: the player made them).
+// After the settings are read (detailed_logs, see RuntimeConfig). Always: the logcat mirror is started (its file named
+// after the run log: crashes our own log cannot see, the GPU driver's messages). Standard: Info-level logging, and old
+// files in the logs folder are removed, keeping the 10 newest starts' run logs, logcat files and shader dumps (frame
+// captures are left alone: the player made them).
 void ApplyLogMode(android_app* app, const dsr::RuntimeConfig& cfg, const std::string& base) {
-    if (cfg.detailed_logs) {
-        LOGI(kTag, "detailed diagnostic files on: logcat mirror, shader dump%s, all log files kept",
-             cfg.auto_capture ? ", automatic frame captures" : "");
-        if (!g_log_via_media_store) return;
+    if (g_log_via_media_store) {
         char logcat_name[80];
         strftime(logcat_name, sizeof(logcat_name), "dsr_%Y%m%d_%H%M%S_logcat.txt", &g_log_time);
         std::string why;
@@ -264,6 +262,10 @@ void ApplyLogMode(android_app* app, const dsr::RuntimeConfig& cfg, const std::st
         } else {
             LOGW(kTag, "logcat file not created: %s", why.c_str());
         }
+    }
+    if (cfg.detailed_logs) {
+        LOGI(kTag, "detailed diagnostic files on: shader dump%s, all log files kept",
+             cfg.auto_capture ? ", automatic frame captures" : "");
         return;
     }
     LOGI(kTag, "standard log files (Detailed diagnostic files off in the settings menu): this log only, at Info level");
@@ -449,10 +451,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# appear a frame late), 0 = compile on the spot (can hitch the first time something is seen)\n"
                     "async_pipelines = %d\n"
                     "# auto_capture: 1 = save a few frame captures (dsr_frame_*.bin) during play, for diagnostics\n"
-                    "# (pressing both sticks in, L3 + R3, always saves one)\n"
+                    "# (with detailed_logs = 1; pressing both sticks in, L3 + R3, then also saves one)\n"
                     "auto_capture = %d\n"
-                    "# detailed_logs: 1 = also write the logcat mirror, a shader dump and (with auto_capture) frame\n"
-                    "# captures, and keep every log file; 0 = one log per start, the 10 newest starts' files kept\n"
+                    "# detailed_logs: 1 = also write a shader dump and (with auto_capture) frame captures, and keep every\n"
+                    "# log file; 0 = a log and a logcat file per start, the 10 newest starts' files kept\n"
                     "detailed_logs = 0\n"
                     "# keep_alive: 1 = a \"DSR Native is running\" notification while the game runs, so Android closes\n"
                     "# the game in the background far less often; 0 = off\n"
@@ -1017,6 +1019,9 @@ void CheckCaptureCombo(const char* source) {
     if (!held) {
         g_capture_combo = false;
     } else if (!g_capture_combo.exchange(true)) {
+        // Only with detailed diagnostic files on: with the touch controls (L3 and LOCK) players pressed it by accident
+        // and found frame captures they had not asked for.
+        if (!dsr::GetRuntime().config.detailed_logs) return;
         LOGI(kTag, "L3 + R3 (%s): frame capture requested", source);
         dsr::hle::nvn::GetBackend().RequestCapture(0);
     }

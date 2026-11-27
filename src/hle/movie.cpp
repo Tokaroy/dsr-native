@@ -208,7 +208,9 @@ int ExSetDataSourcePath(void* self, const char* path) {
             e->track_kind.push_back(kind);
             if (f) AMediaFormat_delete(f);
         }
-    if (r == AMEDIA_OK) dsr::hle::nvn::GetBackend().RequestCapture(8);  // diagnostics: what a video frame shows
+    // Diagnostics (what a video frame shows): only with automatic captures on (it ran at every video, every start).
+    if (r == AMEDIA_OK && dsr::GetRuntime().config.auto_capture && dsr::GetRuntime().config.detailed_logs)
+        dsr::hle::nvn::GetBackend().RequestCapture(8);
     return r == AMEDIA_OK ? kOk : kFail;
 #else
     LOGI(kTag, "Extractor::SetDataSource(%s): no media backend on this host (0 tracks)", path);

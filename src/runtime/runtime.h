@@ -31,9 +31,9 @@ struct RuntimeConfig {
     int display_hz = 60;          // the screen's highest refresh rate at its resolution (from the activity)
     bool async_pipelines = true;  // compile new GPU pipelines off the render thread (no hitch; the draw waits a frame)
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
-    // detailed_logs (settings menu "Detailed diagnostic files", off by default): on = also the logcat mirror, the
-    // shader dump, auto_capture, and every file kept; off = only the run log (Info level), and only the 10 newest
-    // starts' log files kept in Download/DSRNative/logs.
+    // detailed_logs (settings menu "Detailed diagnostic files", off by default): on = also the shader dump,
+    // auto_capture (and the L3 + R3 capture), and every file kept; off = the run log (Info level) and the logcat
+    // mirror, and only the 10 newest starts' log files kept in Download/DSRNative/logs.
     bool detailed_logs = false;
     // mali_tile_turbo (experimental, Mali GPUs only): image layout transitions scoped to the stages and accesses their
     // layouts name, instead of waiting for / blocking all GPU work (vk_backend.cpp, LayoutScope).
