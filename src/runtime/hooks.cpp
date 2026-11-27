@@ -3,14 +3,6 @@
 // version with different programs). They replace engine functions whose output is useful to us but goes
 // nowhere in a retail build, and patch the frame rate and resolution. The places were found in 1.0.0 and matched
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
-#include <cerrno>
-#include <ucontext.h>
-#if defined(__aarch64__)
-#include <asm/sigcontext.h>
-#endif
-#include <sys/mman.h>
-#include <signal.h>
-#include <unordered_set>
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -240,64 +232,14 @@ void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
     LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
 }
 
-// Diagnostics (swipe camera, direct camera control): which game code reads the right stick. The pad class's analog
-// getter (1.0.0 main+0x81a5dc: index 3..8 -> float at this+0x468 + 4 * (index - 3); 3/4 the right stick X/Y, 5/6
-// the left stick) is replaced by the same lookup that also logs each new caller (and its caller) of the stick
-// channels, the first 48. The camera code that turns the stick into a turn is among them.
-struct PadProbe {
-    const char* build_id;
-    uint64_t getter;
-};
-const PadProbe kPadProbes[] = {
-    {"5a797a3a", 0x81a5dc},
-    {"6569410c", 0x8130cc},
-    {"df3766a2", 0x815aa0},
-};
-uint32_t g_pad_analog_base = 0x468;
-uintptr_t g_main_base = 0, g_main_end = 0;
-std::mutex g_probe_mutex;
-std::unordered_set<uint64_t> g_probe_seen;
-
-void CamNote(int i, float v);
-// The swipe camera's diagnostics (pad probe, action probe and read trap, action / turn getter probes, per-second
-// camera line): off now that the camera's caps are found; they cost a fault or a lock per read.
-constexpr bool kCameraDiagnostics = false;
-
-float PadAnalogProbe(const uint8_t* self, int index) {
-    const unsigned i = unsigned(index - 3);
-    const float v = i <= 5 ? *reinterpret_cast<const float*>(self + g_pad_analog_base + 4 * i) : 0.0f;
-    if ((index == 3 || index == 4) && v != 0.0f) CamNote(5, v);
-    if (index == 3 || index == 4) {
-        // Every reader goes through the device set's "first device with a non-zero value" (main+0x816968 in df37),
-        // so the reader is its caller: followed through the frame records (x29), only while each one lies close
-        // above the previous on this stack (x29 may hold anything otherwise).
-        uintptr_t ret[4] = {reinterpret_cast<uintptr_t>(__builtin_return_address(0)), 0, 0, 0};
-        uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-        for (int k = 1; k < 4 && fp; k++) {
-            const uintptr_t next = *reinterpret_cast<const uintptr_t*>(fp);
-            if (!(next > fp && next - fp < (1u << 20) && next % 16 == 0)) break;
-            fp = next;
-            ret[k] = *reinterpret_cast<const uintptr_t*>(fp + 8);
-        }
-        const uint64_t key = (uint64_t(ret[0]) * 31 + ret[1]) * 31 + ret[2] + uint64_t(index);
-        std::lock_guard<std::mutex> lk(g_probe_mutex);
-        if (g_probe_seen.size() < 64 && g_probe_seen.insert(key).second) {
-            auto off = [](uintptr_t a) -> long {
-                return a >= g_main_base && a < g_main_end ? long(a - g_main_base) : -1;
-            };
-            LOGI("hooks", "pad probe: right stick %s read (now %.3f) from main+0x%lx <- 0x%lx <- 0x%lx <- 0x%lx",
-                 index == 3 ? "X" : "Y", v, off(ret[0]), off(ret[1]), off(ret[2]), off(ret[3]));
-        }
-    }
-    return v;
-}
-
-// The game's input mapping (df37 main+0x830400): every frame each pad channel is read, passed through a dead zone,
-// scaled and clamped to +-max, and written back; the parameters of entry i come from this getter (28-byte entries:
-// +0 channel, +4 paired channel or -1, +8 dead zone, +12 threshold, +16 scale, +20 max, +24 flag). The right stick
-// (channels 3 and 4) is clamped to max (1), which is why touch values past full tilt changed nothing. The swipe camera
-// test raises max to 4 for those two channels: only touch input goes past 1, so controllers are not affected. The
-// entries are logged once.
+// Swipe camera (touch_camera_mode = swipe): the thumb's speed becomes the right stick's tilt, which may go past full
+// tilt for fast swipes. The game caps and reshapes the right stick in five places; each is lifted only while the swipe
+// camera is in use (the touch right stick is non-zero in that mode), so controllers and the touch stick are unchanged.
+//
+// 1. The input mapping (df37 main+0x830400) reads each pad channel, applies a dead zone and a scale and clamps it to
+//    +-max; the parameters of entry i come from this getter (28-byte entries: +0 channel, +4 paired channel or -1,
+//    +8 dead zone, +12 threshold, +16 scale, +20 max, +24 flag). A max of 1 is raised to 8: only the swipe camera sends
+//    more than full tilt (controllers and the touch sticks stop at 1).
 struct MapEntryHook {
     const char* build_id;
     uint64_t getter;
@@ -317,21 +259,12 @@ void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zon
     memcpy(scale, e + 16, 4);
     memcpy(max, e + 20, 4);
     *flag = e[24];
-    static std::atomic<uint64_t> logged{0};
-    if (i >= 0 && i < 64 && !(logged.fetch_or(1ull << i) & (1ull << i)))
-        LOGI("hooks", "input mapping %d: channel %d (pair %d), dead zone %.3f, threshold %.3f, scale %.3f, max %.3f, "
-             "flag %u", i, *channel, *pair, *dead_zone, *threshold, *scale, *max, *flag);
-    // Every channel capped at full tilt is allowed to 4: only the touch swipe camera sends more than 1 (controllers
-    // and the touch sticks stop at 1). The camera's actions (18 / 19) come from entries without a dead zone, clamped
-    // per axis, so raising only the right stick's dead-zone entries (channels 3 / 4) left a cap of 1 per axis.
     if (*max >= 0.99f && *max <= 1.01f) *max = 8.0f;
 }
 
-// The action mapping (df37 main+0x81c848, used by main+0x82ffa8): after the channels, each action's frame value gets
-// a dead zone and a scale and is clamped to +-max per action (28-byte entries: +0 action, +4 paired action, +8, +12,
-// +16 scale, +20 max, +24 dead zone; max goes out through the stack argument). That per-axis clamp to 1 is what held
-// the camera's actions (both axes at 1, length 1.41, with the touch at 2.69). Replaced by the same code that lets a max
-// of 1 go to 4 while the touch swipe camera is past full tilt, so nothing else changes.
+// 2. The action mapping (df37 main+0x81c848, used by main+0x82ffa8): each action's frame value gets a dead zone and a
+//    scale and is clamped to +-max per axis (28-byte entries: +0 action, +4 paired action, +8, +12, +16 scale, +20 max,
+//    +24 dead zone; max goes out through the stack argument). A max of 1 goes to 8 while swiping.
 struct ActionMapHook {
     const char* build_id;
     uint64_t fn;
@@ -354,401 +287,9 @@ void ActionMapEntry(const uint8_t* self, int i, uint32_t* action, uint32_t* pair
     if (*max >= 0.99f && *max <= 1.01f && dsr::input::TouchSwipeActive()) *max = 8.0f;
 }
 
-// The input layer's action setter (df37 main+0x82c900): each device channel that drives a user action passes its value
-// here; the action keeps its largest positive and its most negative value of the frame (+208, +248) and their sum
-// (+328), which is later copied to the array the game reads (+32). Replaced by the same code that logs, once per
-// action, its id and the first non-zero value: the right stick's action ids lead to the camera code that reads them.
-struct ActionSetHook {
-    const char* build_id;
-    uint64_t setter;
-};
-const ActionSetHook kActionSetHooks[] = {
-    {"5a797a3a", 0x8312d0},
-    {"df3766a2", 0x82c900},
-};
-// Read trap (diagnostics): the camera reads the right stick's actions (6 / 7 while walking) through code no hook sees.
-// A trap on the arrays' own pages caught nothing (any access to the page opened it, and those pages are busy), so the
-// input object's two action arrays (the frame sums, std::vector at +328, and the published copy at +32) are moved to
-// pages of their own: copied, and the vectors pointed at the copies (their sizes do not change after start-up). For
-// 10 s after the camera first turns, those pages are made inaccessible every 2 ms; an access faults, the handler notes
-// the instruction, its return address and the action index, opens the page and lets the instruction run. Each new
-// reader is logged (48 at most), then the counts.
-#if defined(__aarch64__)
-struct TrapRange {
-    std::atomic<uintptr_t> lo{0}, hi{0};
-};
-TrapRange g_trap[2];
-std::atomic<bool> g_trap_on{false}, g_trap_armed{false};
-struct sigaction g_trap_old;
-size_t g_trap_page_size = 4096;
-std::atomic<int> g_trap_count{0};
-std::atomic<uint32_t> g_trap_faults{0}, g_trap_camera{0};
-uint64_t g_trap_seen[48];
-std::atomic<uint64_t> g_trap_pending[48];  // array << 63 | index << 56 | pc offset << 28 | lr offset
-
-// Camera trap: the page holding the camera input the player's pad manipulator stores (its object +64: turn x, y;
-// stored at df37 main+0x2b223c from the camera getters main+0x68b704 / 0x68b764), to find the code that turns the
-// camera by it. Same scheme; only accesses to those 8 bytes are recorded.
-std::atomic<uintptr_t> g_cam_trap_lo{0}, g_cam_trap_at{0};
-std::atomic<bool> g_cam_trap_on{false}, g_trap_handler{false};
-std::atomic<int> g_cam_trap_count{0};
-std::atomic<uint32_t> g_cam_trap_faults{0}, g_cam_trap_hits{0};
-uint64_t g_cam_trap_seen[32];
-std::atomic<uint64_t> g_cam_trap_pending[32];  // offset << 56 | pc offset << 28 | lr offset
-
-// The camera input's page is busy (the rest of the object), so waiting for the first access after re-arming rarely
-// caught the reader. Instead the faulting load or store is carried out here (the common addressing forms) and the
-// page stays closed: every access is seen. Other forms open the page until the next re-arm.
-__uint128_t* TrapFpRegs(ucontext_t* uc) {
-    uint8_t* p = reinterpret_cast<uint8_t*>(uc->uc_mcontext.__reserved);
-    for (size_t off = 0; off + sizeof(_aarch64_ctx) <= sizeof(uc->uc_mcontext.__reserved);) {
-        auto* h = reinterpret_cast<_aarch64_ctx*>(p + off);
-        if (h->magic == 0 || h->size == 0) break;
-        if (h->magic == FPSIMD_MAGIC) return reinterpret_cast<fpsimd_context*>(h)->vregs;
-        off += h->size;
-    }
-    return nullptr;
-}
-struct TrapAccess {
-    uintptr_t addr = 0;
-    unsigned bytes = 0, count = 1;  // count 2: a pair
-    bool load = false, fp = false;
-    int sext = 0;  // 32 / 64: sign-extending load
-    int rt = 0, rt2 = 0;
-    int wb_reg = -1;  // writeback base
-    uintptr_t wb_value = 0;
-};
-bool TrapDecode(const ucontext_t* uc, uint32_t w, TrapAccess* t) {
-    const auto& mc = uc->uc_mcontext;
-    auto base = [&](int r) -> uint64_t { return r == 31 ? mc.sp : mc.regs[r]; };
-    auto reg = [&](int r) -> uint64_t { return r == 31 ? 0 : mc.regs[r]; };
-    const int rn = (w >> 5) & 31;
-    t->rt = w & 31;
-    const unsigned size = w >> 30, v = (w >> 26) & 1;
-    auto single = [&](unsigned opc) -> bool {
-        if (v) {
-            if (opc >= 2) {
-                if (size) return false;
-                t->bytes = 16;
-                t->load = opc == 3;
-            } else {
-                t->bytes = 1u << size;
-                t->load = opc == 1;
-            }
-            t->fp = true;
-        } else {
-            t->bytes = 1u << size;
-            t->load = opc != 0;
-            if (opc == 2) {
-                if (size == 3) return false;  // prefetch
-                t->sext = 64;
-            } else if (opc == 3) {
-                if (size >= 2) return false;
-                t->sext = 32;
-            }
-        }
-        return true;
-    };
-    if ((w & 0x3B000000) == 0x39000000) {  // unsigned offset
-        if (!single((w >> 22) & 3)) return false;
-        t->addr = base(rn) + uint64_t((w >> 10) & 0xFFF) * t->bytes;
-        return true;
-    }
-    if ((w & 0x3B200000) == 0x38000000) {  // unscaled / post / pre index
-        if (!single((w >> 22) & 3)) return false;
-        const int64_t imm = int64_t(int32_t(w << 11) >> 23);
-        const unsigned mode = (w >> 10) & 3;
-        t->addr = base(rn) + (mode == 1 ? 0 : imm);
-        if (mode == 1 || mode == 3) {
-            t->wb_reg = rn;
-            t->wb_value = base(rn) + imm;
-        }
-        return true;
-    }
-    if ((w & 0x3B200C00) == 0x38200800) {  // register offset
-        if (!single((w >> 22) & 3)) return false;
-        const uint64_t m = reg((w >> 16) & 31);
-        const unsigned option = (w >> 13) & 7;
-        int64_t off;
-        if (option == 2) off = int64_t(uint32_t(m));
-        else if (option == 6) off = int64_t(int32_t(uint32_t(m)));
-        else if (option == 3 || option == 7) off = int64_t(m);
-        else return false;
-        if ((w >> 12) & 1) off <<= __builtin_ctz(t->bytes);
-        t->addr = base(rn) + uint64_t(off);
-        return true;
-    }
-    if ((w & 0x3A000000) == 0x28000000) {  // pair
-        const unsigned opc = w >> 30, idx = (w >> 23) & 3;
-        t->load = (w >> 22) & 1;
-        t->fp = v;
-        t->count = 2;
-        t->rt2 = (w >> 10) & 31;
-        if (v) {
-            if (opc == 3) return false;
-            t->bytes = 4u << opc;
-        } else if (opc == 0) {
-            t->bytes = 4;
-        } else if (opc == 2) {
-            t->bytes = 8;
-        } else if (opc == 1 && t->load) {
-            t->bytes = 4;
-            t->sext = 64;
-        } else {
-            return false;
-        }
-        const int64_t imm = int64_t(int32_t(w << 10) >> 25) * int64_t(t->bytes);
-        t->addr = base(rn) + (idx == 1 ? 0 : imm);
-        if (idx == 1 || idx == 3) {
-            t->wb_reg = rn;
-            t->wb_value = base(rn) + imm;
-        }
-        return true;
-    }
-    return false;
-}
-bool TrapExecute(ucontext_t* uc, const TrapAccess& t) {
-    __uint128_t* vr = t.fp ? TrapFpRegs(uc) : nullptr;
-    if (t.fp && !vr) return false;
-    auto& mc = uc->uc_mcontext;
-    for (unsigned k = 0; k < t.count; k++) {
-        const int r = k ? t.rt2 : t.rt;
-        uint8_t* p = reinterpret_cast<uint8_t*>(t.addr + k * t.bytes);
-        if (t.load) {
-            if (t.fp) {
-                __uint128_t v = 0;
-                memcpy(&v, p, t.bytes);
-                vr[r] = v;
-            } else {
-                uint64_t v = 0;
-                memcpy(&v, p, t.bytes);
-                if (t.sext && t.bytes < 8) {
-                    const int sh = 64 - 8 * int(t.bytes);
-                    v = uint64_t(int64_t(v << sh) >> sh);
-                    if (t.sext == 32) v &= 0xFFFFFFFFull;
-                }
-                if (r != 31) mc.regs[r] = v;
-            }
-        } else {
-            if (t.fp) {
-                memcpy(p, &vr[r], t.bytes);
-            } else {
-                const uint64_t v = r == 31 ? 0 : mc.regs[r];
-                memcpy(p, &v, t.bytes);
-            }
-        }
-    }
-    if (t.wb_reg >= 0) {
-        if (t.wb_reg == 31) mc.sp = t.wb_value;
-        else mc.regs[t.wb_reg] = t.wb_value;
-    }
-    mc.pc += 4;
-    return true;
-}
-
-void TrapHandler(int sig, siginfo_t* si, void* ctx) {
-    const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
-    if (const uintptr_t lo = g_cam_trap_lo.load(std::memory_order_relaxed);
-        lo && a >= lo && a < lo + g_trap_page_size) {
-        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
-        g_cam_trap_faults.fetch_add(1, std::memory_order_relaxed);
-        const uintptr_t at = g_cam_trap_at.load(std::memory_order_relaxed);
-        auto* uc = static_cast<ucontext_t*>(ctx);
-        const bool guest = uc->uc_mcontext.pc >= g_main_base && uc->uc_mcontext.pc < g_main_end;
-        TrapAccess t;
-        bool done = false;
-        if (guest && TrapDecode(uc, *reinterpret_cast<const uint32_t*>(uc->uc_mcontext.pc), &t)) {
-            const uint64_t pc0 = uc->uc_mcontext.pc;
-            const uintptr_t end = t.addr + uintptr_t(t.bytes) * t.count;
-            if (t.addr < at + 8 && end > at) {
-                g_cam_trap_hits.fetch_add(1, std::memory_order_relaxed);
-                const uint64_t pc = (pc0 - g_main_base) & 0x07FFFFFF;
-                const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
-                const uint64_t off = t.addr >= at ? t.addr - at : 0;
-                const uint64_t key = ((off & 0x7F) << 56) | (uint64_t(t.load) << 55) | (pc << 28) | lr;
-                const int n = g_cam_trap_count.load(std::memory_order_relaxed);
-                bool seen = false;
-                for (int i = 0; i < n && i < 32; i++) seen |= g_cam_trap_seen[i] == key;
-                if (!seen && n < 32) {
-                    g_cam_trap_seen[n] = key;
-                    g_cam_trap_pending[n].store(key, std::memory_order_relaxed);
-                    g_cam_trap_count.store(n + 1, std::memory_order_release);
-                }
-            }
-            (void)TrapExecute;  // carrying the access out froze the game: the page opens instead (re-armed often)
-        }
-        if (done && g_cam_trap_lo.load(std::memory_order_relaxed))
-            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
-        return;
-    }
-    for (int w = 0; w < 2; w++) {
-        const uintptr_t lo = g_trap[w].lo.load(std::memory_order_relaxed);
-        if (!lo || a < lo || a >= lo + g_trap_page_size) continue;
-        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
-        g_trap_faults.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t index = (a - lo) / 4;
-        if (index == 6 || index == 7) g_trap_camera.fetch_add(1, std::memory_order_relaxed);
-        auto* uc = static_cast<ucontext_t*>(ctx);
-        if (uc->uc_mcontext.pc < g_main_base || uc->uc_mcontext.pc >= g_main_end) return;  // our own code
-        const uint64_t pc = (uc->uc_mcontext.pc - g_main_base) & 0x0FFFFFFF;
-        const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
-        const uint64_t key = (uint64_t(w) << 63) | ((index & 0x7F) << 56) | (pc << 28) | lr;
-        const int n = g_trap_count.load(std::memory_order_relaxed);
-        bool seen = false;
-        for (int i = 0; i < n && i < 48; i++) seen |= g_trap_seen[i] == key;
-        if (!seen && n < 48) {
-            g_trap_seen[n] = key;
-            g_trap_pending[n].store(key, std::memory_order_relaxed);
-            g_trap_count.store(n + 1, std::memory_order_release);
-        }
-        return;
-    }
-    // Not ours: the previous handler (the crash handler).
-    if (g_trap_old.sa_flags & SA_SIGINFO) {
-        if (g_trap_old.sa_sigaction) g_trap_old.sa_sigaction(sig, si, ctx);
-    } else if (g_trap_old.sa_handler != SIG_DFL && g_trap_old.sa_handler != SIG_IGN) {
-        g_trap_old.sa_handler(sig);
-    } else {
-        signal(sig, SIG_DFL);
-        raise(sig);
-    }
-}
-
-void StartCamTrap(uintptr_t at) {
-    bool expected = false;
-    if (!g_cam_trap_on.compare_exchange_strong(expected, true)) return;
-    g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
-    const uintptr_t lo = at & ~uintptr_t(g_trap_page_size - 1);
-    g_cam_trap_at = at;
-    LOGI("hooks", "camera trap: watching the camera's angles at %p (page %p)", reinterpret_cast<void*>(at),
-         reinterpret_cast<void*>(lo));
-    struct sigaction sa {};
-    sa.sa_sigaction = TrapHandler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    if (!g_trap_handler.exchange(true)) sigaction(SIGSEGV, &sa, &g_trap_old);
-    std::thread([lo] {
-        int logged = 0;
-        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        g_cam_trap_lo = lo;
-        while (std::chrono::steady_clock::now() < end) {
-            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);  // after an access not carried out
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            const int n = g_cam_trap_count.load(std::memory_order_acquire);
-            for (; logged < n; logged++) {
-                const uint64_t v = g_cam_trap_pending[logged].load(std::memory_order_relaxed);
-                LOGI("hooks", "camera trap: camera angle +%d %s at main+0x%llx (return main+0x%llx)",
-                     320 + int((v >> 56) & 0x7F), (v >> 55) & 1 ? "read" : "written",
-                     (unsigned long long)((v >> 28) & 0x07FFFFFF),
-                     (unsigned long long)(v & 0x0FFFFFFF));
-            }
-        }
-        g_cam_trap_lo = 0;
-        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
-        LOGI("hooks", "camera trap: done, %d accessors (%u faults, %u on the camera input)", g_cam_trap_count.load(),
-             g_cam_trap_faults.load(), g_cam_trap_hits.load());
-    }).detach();
-}
-
-// Our own hooks touch the trapped pages first every frame (the action setter, the stick vector), which opened them
-// before any game reader got there: they close them again right after.
-void TrapRearm() {
-    if (!g_trap_on.load(std::memory_order_relaxed)) return;
-    for (auto& r : g_trap) {
-        const uintptr_t lo = r.lo.load(std::memory_order_relaxed);
-        if (lo) mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
-    }
-}
-
-// Moves a std::vector<float> (begin, end, capacity at `vec`) to a page of its own; its address, or 0.
-uintptr_t MoveToOwnPage(uint8_t* vec) {
-    auto* p = reinterpret_cast<uintptr_t*>(vec);
-    const uintptr_t begin = p[0], endp = p[1];
-    const size_t bytes = endp - begin;
-    if (!begin || endp < begin || bytes == 0 || bytes > g_trap_page_size) return 0;
-    void* page = mmap(nullptr, g_trap_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) return 0;
-    memcpy(page, reinterpret_cast<const void*>(begin), bytes);
-    const uintptr_t np = reinterpret_cast<uintptr_t>(page);
-    p[0] = np;
-    p[1] = np + bytes;
-    p[2] = np + bytes;
-    return np;
-}
-
-void StartReadTrap(uint8_t* input) {
-    bool expected = false;
-    if (!g_trap_on.compare_exchange_strong(expected, true)) return;
-    g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
-    const size_t n_sums = (*reinterpret_cast<uintptr_t*>(input + 336) - *reinterpret_cast<uintptr_t*>(input + 328)) / 4;
-    const size_t n_copy = (*reinterpret_cast<uintptr_t*>(input + 40) - *reinterpret_cast<uintptr_t*>(input + 32)) / 4;
-    const uintptr_t sums = MoveToOwnPage(input + 328), copy = MoveToOwnPage(input + 32);
-    LOGI("hooks", "read trap: action arrays moved to their own pages: sums (%zu) %s, copy (%zu) %s", n_sums,
-         sums ? "ok" : "not moved", n_copy, copy ? "ok" : "not moved");
-    g_trap[0].lo = sums;
-    g_trap[1].lo = copy;
-    struct sigaction sa {};
-    sa.sa_sigaction = TrapHandler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    if (!g_trap_handler.exchange(true)) sigaction(SIGSEGV, &sa, &g_trap_old);
-    std::thread([] {
-        int logged = 0, fails = 0;
-        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (std::chrono::steady_clock::now() < end) {
-            for (auto& r : g_trap)
-                if (r.lo && mprotect(reinterpret_cast<void*>(r.lo.load()), g_trap_page_size, PROT_NONE) != 0 &&
-                    fails++ == 0)
-                    LOGW("hooks", "read trap: mprotect failed (%s)", strerror(errno));
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            for (auto& r : g_trap)
-                if (r.lo) mprotect(reinterpret_cast<void*>(r.lo.load()), g_trap_page_size, PROT_READ | PROT_WRITE);
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            const int n = g_trap_count.load(std::memory_order_acquire);
-            for (; logged < n; logged++) {
-                const uint64_t v = g_trap_pending[logged].load(std::memory_order_relaxed);
-                LOGI("hooks", "read trap: action %d of the %s read at main+0x%llx (return main+0x%llx)",
-                     int((v >> 56) & 0x7F), (v >> 63) ? "published copy" : "frame sums",
-                     (unsigned long long)((v >> 28) & 0x0FFFFFFF), (unsigned long long)(v & 0x0FFFFFFF));
-            }
-        }
-        for (auto& r : g_trap) {  // the moved arrays stay where they are
-            const uintptr_t lo = r.lo.exchange(0);
-            if (lo) mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
-        }
-        g_trap_on = false;
-        LOGI("hooks", "read trap: done, %d readers (%u faults, %u on actions 6 / 7)", g_trap_count.load(),
-             g_trap_faults.load(), g_trap_camera.load());
-    }).detach();
-}
-#endif
-
-void ActionSet(uint8_t* self, int id, float v) {
-    float* pos = *reinterpret_cast<float**>(self + 208);
-    float* neg = *reinterpret_cast<float**>(self + 248);
-    float* sum = *reinterpret_cast<float**>(self + 328);
-    float p = pos[id], n = neg[id];
-    if (v >= 0.0f) {
-        if (p < v) pos[id] = p = v;
-    } else if (n > v) {
-        neg[id] = n = v;
-    }
-    sum[id] = p + n;
-    static std::atomic<uint64_t> logged[2];
-    if (v != 0.0f && id >= 0 && id < 128 && !(logged[id >> 6].fetch_or(1ull << (id & 63)) & (1ull << (id & 63))))
-        LOGI("hooks", "input action %d: first value %.3f (input object @%p, read array @%p)", id, v,
-             static_cast<void*>(self), *reinterpret_cast<void**>(self + 32));
-#if defined(__aarch64__)
-    if (id == 6 && v != 0.0f) StartReadTrap(self);
-    TrapRearm();
-#endif
-}
-
-// The game's stick vector (df37 main+0x694d20, found with the read trap): actions (x, y) from the published array,
-// a second radial dead zone of 0.37, then length = clamp((len - 0.37) * 1.724, 0, 1) along the stick's direction,
-// returned as two floats in x0. That clamp to 1 is the camera's speed cap. Replaced by the same code without the
-// clamp while the touch swipe camera sends more than full tilt (its length past 1; a stick never gets there, the
-// touch stick is clamped to 1), so controllers, the left stick and the touch stick behave as before.
+// 3. The stick vector (df37 main+0x694d20): actions (x, y) from the published array, a radial dead zone of 0.37, then
+//    length = clamp((len - 0.37) * 1.724, 0, 1) along the stick's direction, returned as two floats in x0. Replaced
+//    by the same code without the clamp to 1 while swiping (the camera reads actions 18 / 19 through it).
 struct StickVecHook {
     const char* build_id;
     uint64_t fn;
@@ -758,89 +299,17 @@ const StickVecHook kStickVecHooks[] = {
     {"6569410c", 0x694d50},
     {"df3766a2", 0x694d20},
 };
-// Camera diagnostics: once a second while the touch camera is past full tilt, the most it sent, the most the camera's
-// stick vector (actions 18 / 19) saw and gave, and the most the turn getters (below) read and returned.
-std::mutex g_cam_mutex;
-float g_cam_max[10];  // touch, vector in, vector out, action 26 in, turn out, pad raw, 18 x / 19 y, getter 6/7, 26/27
-std::chrono::steady_clock::time_point g_cam_next;
-void CamNote(int i, float v) {
-    if (!kCameraDiagnostics) return;
-    std::lock_guard<std::mutex> lk(g_cam_mutex);
-    g_cam_max[i] = std::max(g_cam_max[i], std::fabs(v));
-    g_cam_max[0] = std::max(g_cam_max[0], dsr::input::TouchCameraTilt());
-    const auto now = std::chrono::steady_clock::now();
-    if (now < g_cam_next) return;
-    g_cam_next = now + std::chrono::seconds(1);
-    if (g_cam_max[0] > 1.0f)
-        LOGI("hooks", "camera: last second most: touch %.2f, pad %.2f, stick vector (18, 19) x %.2f y %.2f len %.2f -> "
-             "%.2f, action getter 6/7 %.2f 26/27 %.2f, turn getter %.2f -> %.4f", g_cam_max[0], g_cam_max[5],
-             g_cam_max[6], g_cam_max[7], g_cam_max[1], g_cam_max[2], g_cam_max[8], g_cam_max[9], g_cam_max[3],
-             g_cam_max[4]);
-    for (float& m : g_cam_max) m = 0.0f;
-}
 
-// The camera's turn getters (df37 main+0x6887ac / 0x6887d4): action 26 (27) times 1.5 degrees (minus), read straight
-// from the published array. Same code that logs each caller once and feeds the camera diagnostics.
-struct TurnHook {
-    const char* build_id;
-    uint64_t fn[2];
-};
-const TurnHook kTurnHooks[] = {{"df3766a2", {0x6887ac, 0x6887d4}}};
-float g_turn_scale[2] = {0.02617994f, -0.02617994f};
-template <int K>
-float TurnGetter(const uint8_t* self) {
-    const uint8_t* input = *reinterpret_cast<const uint8_t* const*>(self + 8);
-    const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(input + 8) + 32);
-    const float v = a[26 + K];
-    const float r = v * g_turn_scale[K];
-#if defined(__aarch64__)
-    TrapRearm();
-#endif
-    const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-    {
-        std::lock_guard<std::mutex> lk(g_probe_mutex);
-        if (v != 0.0f && g_probe_seen.size() < 128 && g_probe_seen.insert((uint64_t(ret) << 1) | 1ull << 62 | K).second)
-            LOGI("hooks", "camera turn getter %d: called from main+0x%lx (action %.3f -> %.4f)", K,
-                 ret >= g_main_base && ret < g_main_end ? long(ret - g_main_base) : -1L, v, r);
-    }
-    CamNote(3, v);
-    CamNote(4, r);
-    return r;
-}
-
-// The single action getter (df37 main+0x694d10, 4 instructions: the published array's value): same code that logs
-// each caller of the right stick's actions once and feeds the camera diagnostics.
-const StickVecHook kActionGetHooks[] = {{"df3766a2", 0x694d10}};
-float ActionGet(const uint8_t* self, int id) {
-    const float v = (*reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32))[id];
-#if defined(__aarch64__)
-    TrapRearm();
-#endif
-    if (id == 6 || id == 7 || id == 18 || id == 19 || (id >= 26 && id <= 31)) {
-        const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-        {
-            std::lock_guard<std::mutex> lk(g_probe_mutex);
-            if (v != 0.0f && g_probe_seen.size() < 160 &&
-                g_probe_seen.insert((uint64_t(ret) << 8) | 1ull << 61 | uint64_t(id)).second)
-                LOGI("hooks", "action getter: action %d read by main+0x%lx (%.3f)", id,
-                     ret >= g_main_base && ret < g_main_end ? long(ret - g_main_base) : -1L, v);
-        }
-        if (id == 6 || id == 7) CamNote(8, v);
-        if (id == 26 || id == 27) CamNote(9, v);
-    }
-    return v;
-}
-
-// The camera's yaw (df37 main+0xab8c4, in the camera update): while the horizontal input is past a small threshold,
-// the camera turns at a speed that ramps from its slowest to its fastest over a set time (+312 counts it up, +480 the
-// time), in the input's direction only - how far the stick is pushed does not count. Below the threshold it turns by
-// input times the slowest speed. That ramp is the swipe camera's cap and its lag (a flick ends before the ramp is up).
-// While the touch swipe camera is used, the branch into the ramp is replaced by a jump to the proportional turn, so
-// the camera turns by exactly what the swipe sends; restored when the thumb lifts (sticks keep the game's feel).
-// The camera's follow (df37 main+0xab780): when the character has moved this frame (w19), the camera's angles are
-// worked out again from where the camera now is to the character - so the camera turns after a walking character,
-// against the swipe (and with a stick too: that is the game's own behaviour). While swiping that block is jumped
-// over (cbz w19 -> b), so the camera keeps the angle the thumb gave it and only moves along with the character.
+// 4. The camera's yaw (df37 main+0xab8c4, in the camera update): past a small horizontal threshold the camera turns at
+//    a speed that ramps from its slowest to its fastest over a set time (+312 counts it up, +480 the time), in the
+//    input's direction only - how far the stick is pushed does not count; below it the camera turns by input times
+//    the slowest speed. While swiping the branch into the ramp becomes a jump to the proportional turn, so the camera
+//    turns by exactly what the swipe sends.
+// 5. The camera's follow: the angles are worked out again from the camera's position to its target - every frame
+//    (df37 main+0xab3f8) and when the character has moved (main+0xab780, cbz w19) - so the camera turns after a
+//    moving character (with a stick too: the game's own behaviour). While swiping both are jumped over, so the camera
+//    keeps the angle the thumb gave it and only moves along with the character.
+// Code patches, written when the swipe camera starts and restored when the thumb lifts.
 struct RampPatch {
     const char* build_id;
     uint64_t at;
@@ -849,9 +318,6 @@ struct RampPatch {
     uint32_t follow_orig, follow_repl;  // cbz w19, <past> / b <past>
     uint64_t follow2_at;  // ldr q1, [x20, #208] -> b <past the pitch and yaw stores> (+44)
 };
-// The follow that the trap caught (df37 main+0xab3f8, pitch written at main+0xab410): in the normal camera the
-// angles are worked out from the camera's position to its target every frame, so the camera turns after the
-// character. Jumped over while swiping, like the first one.
 constexpr uint32_t kFollow2Orig = 0x3DC03681, kFollow2Repl = 0x1400000B;
 const RampPatch kRampPatches[] = {
     {"5a797a3a", 0xae554, 0x5400020D, 0x14000010, 0xae41c, 0x340001B3, 0x1400000D, 0xae094},
@@ -875,32 +341,6 @@ void SetCameraProportional(bool on) {
         LOGW("hooks", "swipe camera: camera follow patch 2 failed");
 }
 
-// Diagnostics (df37): the camera update gets the pad manipulator through main+0x2c5900 (called at main+0xaab50, the
-// camera object in x20). Replaced by the same code through a stub that also passes x20 and the return address; the
-// first time it is called from the camera while swiping, the camera trap watches the camera's angles (+320 pitch,
-// +324 yaw) for 10 s to find the code that turns the camera after the character.
-extern "C" uint64_t DsrManipGetterImpl(const uint8_t* self, uintptr_t cam, uintptr_t lr) {
-    const uint8_t* o = *reinterpret_cast<const uint8_t* const*>(self + 72);
-    uint64_t r = *reinterpret_cast<const uint64_t*>(o + 648);
-    if (!r) r = *reinterpret_cast<const uint64_t*>(o + 120);
-#if defined(__aarch64__)
-    if (lr == g_main_base + 0xaab54 && cam && !g_cam_trap_on.load(std::memory_order_relaxed) &&
-        dsr::input::TouchSwipeActive())
-        StartCamTrap(cam + 320);
-#else
-    (void)cam;
-    (void)lr;
-#endif
-    return r;
-}
-extern "C" void DsrManipGetterStub();
-#if defined(__aarch64__)
-asm(".text\n.p2align 2\n.global DsrManipGetterStub\n.type DsrManipGetterStub, %function\nDsrManipGetterStub:\n"
-    "    mov x1, x20\n    mov x2, x30\n    b DsrManipGetterImpl\n");
-#else
-extern "C" void DsrManipGetterStub() {}
-#endif
-
 uint64_t StickVector(const uint8_t* self, int ix, int iy) {
     const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32);
     const float x = a[ix], y = a[iy];
@@ -912,48 +352,14 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
         rx = x / len * m;
         ry = y / len * m;
     }
-#if defined(__aarch64__)
-    TrapRearm();
-#endif
-    if (kCameraDiagnostics) {  // each caller (with its two actions) once, then the first time it gets past full tilt
-        const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-        const uint64_t key = (uint64_t(ret) << 16) | (uint64_t(ix & 0xFF) << 8) | uint64_t(iy & 0xFF);
-        const bool past = len > 0.37f + 1.0f / 1.7241380214691162f + 0.05f;
-        std::lock_guard<std::mutex> lk(g_probe_mutex);
-        const bool first = g_probe_seen.size() < 128 && g_probe_seen.insert(key).second;
-        const bool first_past = past && g_probe_seen.size() < 128 && g_probe_seen.insert(key ^ 1ull << 63).second;
-        if ((first && len > 0.0f) || first_past)
-            LOGI("hooks", "stick vector: actions (%d, %d) for main+0x%lx: length %.3f -> %.3f (touch camera %.2f)",
-                 ix, iy, ret >= g_main_base && ret < g_main_end ? long(ret - g_main_base) : -1L, len,
-                 std::sqrt(rx * rx + ry * ry), dsr::input::TouchCameraTilt());
-        if (first && len == 0.0f) g_probe_seen.erase(key);  // log it once it has a value
-    }
-    if (ix == 18) SetCameraProportional(dsr::input::TouchSwipeActive());
-    if (ix == 18) {
-        CamNote(6, x);
-        CamNote(7, y);
-        CamNote(1, len);
-        CamNote(2, std::sqrt(rx * rx + ry * ry));
-    }
+    if (ix == 18) SetCameraProportional(dsr::input::TouchSwipeActive());  // the camera's actions, once per frame
     uint32_t bx, by;
     memcpy(&bx, &rx, 4);
     memcpy(&by, &ry, 4);
     return uint64_t(bx) | (uint64_t(by) << 32);
 }
 
-static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
-    if (kCameraDiagnostics && !strncmp(b.build_id, "df3766a2", 8)) {  // camera angle trap (diagnostics)
-        // ldr x8,[x0,#72] / ldr x0,[x8,#648] / cbnz x0 / ldr x0,[x8,#120] / ret
-        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + 0x2c5900);
-        std::string err;
-        g_main_base = rt.main.base();
-        g_main_end = g_main_base + 0x8000000;
-        if (code[0] == 0xF9402408 && code[4] == 0xD65F03C0 &&
-            rt.main.HookFunction(0x2c5900, reinterpret_cast<void*>(&DsrManipGetterStub), &err))
-            LOGI("hooks", "camera trap: armed (starts on the first swipe)");
-        else
-            LOGW("hooks", "camera trap: manipulator getter not hooked %s", err.c_str());
-    }
+static void InstallSwipeCamera(Runtime& rt, const GameBuild& b) {
     for (const RampPatch& r : kRampPatches) {
         if (strncmp(r.build_id, b.build_id, strlen(r.build_id))) continue;
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + r.at);
@@ -967,82 +373,29 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
         // cbz w19 / ldr q0, [x20, #208] / ldr q1, [x20, #256]
         const uint32_t* fc = reinterpret_cast<const uint32_t*>(rt.main.base() + r.follow_at);
         g_follow_ok = fc[0] == r.follow_orig && fc[1] == 0x3DC03680 && fc[2] == 0x3DC04281;
-        if (!g_follow_ok) LOGW("hooks", "swipe camera: camera follow not found at main+0x%lx", (unsigned long)r.follow_at);
         // ldr q1, [x20, #208] / fsub v0.4s, v1.4s, v0.4s / stur q0, [x29, #-192] / ldr s0, [x20, #320] ... str s0, [x20, #324]
         const uint32_t* f2 = reinterpret_cast<const uint32_t*>(rt.main.base() + r.follow2_at);
         g_follow2_ok = f2[0] == kFollow2Orig && f2[1] == 0x4EA0D420 && f2[3] == 0xBD414280 && f2[10] == 0xBD014680;
-        if (!g_follow2_ok)
-            LOGW("hooks", "swipe camera: camera follow 2 not found at main+0x%lx", (unsigned long)r.follow2_at);
-        else
-            LOGI("hooks", "swipe camera: the camera does not follow the character while swiping");
-        LOGI("hooks", "swipe camera: the camera's turn ramp is skipped while swiping (main+0x%lx)", (unsigned long)r.at);
+        if (!g_follow_ok || !g_follow2_ok)
+            LOGW("hooks", "swipe camera: camera follow not found (main+0x%lx %s, main+0x%lx %s)",
+                 (unsigned long)r.follow_at, g_follow_ok ? "ok" : "missing", (unsigned long)r.follow2_at,
+                 g_follow2_ok ? "ok" : "missing");
     }
 
+    int hooked = 0;
     for (const StickVecHook& h : kStickVecHooks) {
         if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-        // ldr x8,[x0,#8] / ldr x8,[x8,#0x20] / ldr s10,[x8,w1,sxtw #2] within the first 8 instructions
+        // ldr x8,[x0,#8] / ldr x8,[x8,#0x20] within the first 8 instructions
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
         bool ok = false;
         for (int k = 0; k < 8; k++) ok |= code[k] == 0xF9400408 && code[k + 1] == 0xF9401108;
         std::string err;
         if (!ok)
-            LOGW("hooks", "stick vector not found at main+0x%lx", (unsigned long)h.fn);
+            LOGW("hooks", "swipe camera: stick vector not found at main+0x%lx", (unsigned long)h.fn);
         else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&StickVector), &err))
-            LOGI("hooks", "swipe camera: the camera turns past the stick's top speed for fast swipes");
+            hooked++;
         else
-            LOGW("hooks", "stick vector hook failed: %s", err.c_str());
-    }
-
-    if (kCameraDiagnostics) {
-        for (const StickVecHook& h : kActionGetHooks) {
-            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-            // ldr x8,[x0,#8] / ldr x8,[x8,#32] / ldr s0,[x8,w1,sxtw #2] / ret
-            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
-            std::string err;
-            if (code[0] != 0xF9400408 || code[1] != 0xF9401108 || code[3] != 0xD65F03C0)
-                LOGW("hooks", "action getter not found at main+0x%lx", (unsigned long)h.fn);
-            else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&ActionGet), &err))
-                LOGI("hooks", "action getter: probe");
-            else
-                LOGW("hooks", "action getter hook failed: %s", err.c_str());
-        }
-
-        for (const TurnHook& h : kTurnHooks) {
-            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-            for (int k = 0; k < 2; k++) {
-                // ldr x0,[x0,#8] / mov w1,#26+k / bl / adrp / ldr s1 / fmul s0,s0,s1
-                const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn[k]);
-                if (code[2] != 0xF9400400 || code[3] != 0x52800341u + (uint32_t(k) << 5) || code[7] != 0x1E210800) {
-                    LOGW("hooks", "camera turn getter %d not found at main+0x%lx", k, (unsigned long)h.fn[k]);
-                    continue;
-                }
-                // the scale: adrp (page) + ldr s1, [x8, #imm]
-                const uint64_t at = h.fn[k] + 20;
-                const uint32_t adrp = code[5], ldr = code[6];
-                const int64_t imm = int64_t((((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3)) << 44 >> 32;
-                const uint64_t page = (at & ~0xFFFull) + uint64_t(imm);
-                memcpy(&g_turn_scale[k], reinterpret_cast<const void*>(rt.main.base() + page + ((ldr >> 10) & 0xFFF) * 4), 4);
-                std::string err;
-                if (rt.main.HookFunction(h.fn[k], reinterpret_cast<void*>(k ? &TurnGetter<1> : &TurnGetter<0>), &err))
-                    LOGI("hooks", "camera turn getter %d: probe (scale %.5f)", k, g_turn_scale[k]);
-                else
-                    LOGW("hooks", "camera turn getter %d hook failed: %s", k, err.c_str());
-            }
-        }
-
-        for (const ActionSetHook& h : kActionSetHooks) {
-            if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-            // ldr x9,[x0,#208] / ldr x10,[x0,#248] / sbfiz x11,x1,#2,#32
-            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.setter);
-            std::string err;
-            if (code[0] != 0xF9406809 || code[1] != 0xF9407C0A)
-                LOGW("hooks", "input action setter not found at main+0x%lx", (unsigned long)h.setter);
-            else if (rt.main.HookFunction(h.setter, reinterpret_cast<void*>(&ActionSet), &err))
-                LOGI("hooks", "input action probe: logging the actions the sticks drive");
-            else
-                LOGW("hooks", "input action hook failed: %s", err.c_str());
-        }
-
+            LOGW("hooks", "swipe camera: stick vector hook failed: %s", err.c_str());
     }
 
     for (const MapEntryHook& h : kMapEntryHooks) {
@@ -1051,47 +404,28 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.getter);
         std::string err;
         if (code[0] != 0xF9400409 || code[1] != 0x321E0BEA || code[2] != 0x9B2A7C2B)
-            LOGW("hooks", "input mapping getter not found at main+0x%lx", (unsigned long)h.getter);
+            LOGW("hooks", "swipe camera: input mapping getter not found at main+0x%lx", (unsigned long)h.getter);
         else if (rt.main.HookFunction(h.getter, reinterpret_cast<void*>(&InputMapEntry), &err))
-            LOGI("hooks", "input mapping: channels allowed past full tilt (only the touch swipe camera sends more)");
+            hooked++;
         else
-            LOGW("hooks", "input mapping hook failed: %s", err.c_str());
+            LOGW("hooks", "swipe camera: input mapping hook failed: %s", err.c_str());
     }
 
     for (const ActionMapHook& h : kActionMapHooks) {
         if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
-        // ldr x9,[x0,#8] / orr w10,wzr,#0x1c / smull x11,w1,w10 / ldr w9,[x9,x11] / str w9,[x2] ... ldr x8,[sp] (+0x5c)
+        // ldr x9,[x0,#8] / orr w10,wzr,#0x1c / smull x11,w1,w10 / ... ldr x8,[sp] (+0x5c) ... ret
         const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn);
         std::string err;
         if (code[0] != 0xF9400409 || code[1] != 0x321E0BEA || code[2] != 0x9B2A7C2B || code[23] != 0xF94003E8 ||
             code[30] != 0xD65F03C0)
-            LOGW("hooks", "action mapping getter not found at main+0x%lx", (unsigned long)h.fn);
+            LOGW("hooks", "swipe camera: action mapping getter not found at main+0x%lx", (unsigned long)h.fn);
         else if (rt.main.HookFunction(h.fn, reinterpret_cast<void*>(&ActionMapEntry), &err))
-            LOGI("hooks", "action mapping: actions allowed past full tilt while the swipe camera is");
+            hooked++;
         else
-            LOGW("hooks", "action mapping hook failed: %s", err.c_str());
+            LOGW("hooks", "swipe camera: action mapping hook failed: %s", err.c_str());
     }
-
-    if (!kCameraDiagnostics) return;
-    const PadProbe* p = nullptr;
-    for (const PadProbe& c : kPadProbes)
-        if (!strncmp(c.build_id, b.build_id, strlen(c.build_id))) p = &c;
-    if (!p) return;
-    // The getter, as in every build: sub w8,w1,#3 / cmp w8,#5 / b.hi / add x8,x0,w8,sxtw #2 / ldr s0,[x8,#base]
-    const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + p->getter);
-    if (code[0] != 0x51000C28 || code[1] != 0x7100151F || (code[4] & 0xFFC003FF) != 0xBD400100) {
-        LOGW("hooks", "pad probe: getter not found at main+0x%lx", (unsigned long)p->getter);
-        return;
-    }
-    g_pad_analog_base = ((code[4] >> 10) & 0xFFF) * 4;
-    g_main_base = rt.main.base();
-    g_main_end = g_main_base + 0x8000000;
-    std::string err;
-    if (rt.main.HookFunction(p->getter, reinterpret_cast<void*>(&PadAnalogProbe), &err))
-        LOGI("hooks", "pad probe: logging which code reads the sticks (getter main+0x%lx, values at +0x%x)",
-             (unsigned long)p->getter, g_pad_analog_base);
-    else
-        LOGW("hooks", "pad probe not installed: %s", err.c_str());
+    if (g_ramp && hooked == 3)
+        LOGI("hooks", "swipe camera: fast swipes turn past the stick's top speed, no turn ramp or follow while swiping");
 }
 
 // The engine's screen size block (1.0.0 main+0x1aeba90, 0x200 past GameBuild::shadow_size in every build):
@@ -1653,7 +987,7 @@ void InstallGameHooks() {
         else
             LOGW("hooks", "dynamic buffer size not changed (%s)", err.c_str());
     }
-    InstallCameraInputProbe(rt, b);
+    InstallSwipeCamera(rt, b);
     const Hook hooks[] = {
         {b.log, reinterpret_cast<void*>(&EngineLog), "engine log"},
         {b.vlog, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},

@@ -378,11 +378,12 @@ std::string g_custom_game_dir;  // settings.txt `game_dir`: a game folder the pl
 
 #define TOUCH_HELP                                                                                            \
     "# Touch controls: a stick at the bottom left, the Switch buttons around the edges (LOCK = lock-on, the\n" \
-    "# right stick press); touch the right side anywhere else for a camera stick that follows your finger.\n"  \
+    "# right stick press); drag on the right side anywhere else to turn the camera.\n"                           \
     "# They hide when a controller is connected or used; double-tap the screen to bring them back.\n"         \
-    "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: how far the camera\n"   \
-    "# stick moves for a full turn (1 = to its edge, 2 = half that). touch_camera_invert: 1 = up looks down.\n" \
-    "# touch_camera_mode: stick, or swipe (the camera follows the thumb's movement and stops when it stops).\n"
+    "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: the camera sensitivity\n" \
+    "# (1 = normal, 2 = twice as fast). touch_camera_invert: 1 = up looks down.\n"                             \
+    "# touch_camera_mode: swipe (default: the camera follows the thumb's movement and stops when it stops), or\n" \
+    "# stick (a camera stick appears where you touch).\n"
 #define TOUCH_DEFAULTS "touch_controls = 1\ntouch_opacity = 0.7\ntouch_camera_speed = 1.0\ntouch_camera_invert = 0\n"
 
 #define ASPECT_HELP                                                                                          \
@@ -561,7 +562,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "touch_camera_invert")) {
                 g_touch.camera_invert = v != 0;
             } else if (!strcmp(key, "touch_camera_mode")) {
-                dsr::input::SetTouchSwipe(!strcmp(value, "swipe"));
+                dsr::input::SetTouchSwipe(strcmp(value, "stick") != 0);
             } else if (!strcmp(key, "bc_enabler")) {
                 cfg->bc_enabler = v != 0;
                 have_bc_enabler = true;
@@ -1110,7 +1111,7 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
         g_touch.camera_invert = atoi(value.c_str()) != 0;
         now = true;
     } else if (key == "touch_camera_mode") {
-        dsr::input::SetTouchSwipe(value == "swipe");
+        dsr::input::SetTouchSwipe(value != "stick");
         now = true;
     } else if (key == "touch_controls") {  // the overlay itself is changed by the menu (Java)
         g_touch.enabled = atoi(value.c_str()) != 0;

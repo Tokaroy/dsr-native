@@ -55,7 +55,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
      * does, by how fast the thumb moves (no stick: the camera stops when the thumb stops). stick (default): the
      * floating camera stick.
      */
-    static volatile boolean sSwipe = false;
+    static volatile boolean sSwipe = true;  // touch_camera_mode: swipe unless set to stick
     /** Offsets of the groups from their default spots, in layout units (settings.txt touch_layout). */
     private static volatile Map<String, float[]> sLayout = new HashMap<>();
     /** Groups that can be moved, in settings.txt. */

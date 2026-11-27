@@ -682,10 +682,9 @@ final class Strings {
                 "스와이프: 화면 오른쪽을 드래그하면 카메라가 엄지를 따라가며, 빠르게 움직일수록 빠르게 돕니다. 엄지를 멈추면 카메라도 멈춥니다. 스틱: 터치한 곳에 카메라 스틱이 나타납니다.",
                 "滑动：在屏幕右侧拖动，视角跟随拇指移动，移动越快转得越快；拇指停下视角也停下。摇杆：在触摸处出现视角摇杆。",
                 "滑動：在螢幕右側拖曳，視角跟隨拇指移動，移動越快轉得越快；拇指停下視角也停下。搖桿：在觸碰處出現視角搖桿。");
-        put("camspeed_t", "Camera stick speed", "Vitesse du stick caméra", "Tempo des Kamerasticks",
-                "Velocità dello stick della telecamera", "Velocidad del stick de cámara",
-                "Velocidade do analógico da câmera", "Скорость стика камеры", "カメラスティックの速さ", "카메라 스틱 속도",
-                "视角摇杆速度", "視角搖桿速度");
+        put("camspeed_t", "Camera sensitivity", "Sensibilité de la caméra", "Kameraempfindlichkeit",
+                "Sensibilità della telecamera", "Sensibilidad de la cámara", "Sensibilidade da câmera",
+                "Чувствительность камеры", "カメラ感度", "카메라 감도", "视角灵敏度", "視角靈敏度");
         put("speed_slow", "Slow", "Lente", "Langsam", "Lenta", "Lenta", "Lenta", "Медленно", "遅い", "느리게", "慢", "慢");
         put("speed_normal", "Normal", "Normale", "Normal", "Normale", "Normal", "Normal", "Обычно", "普通", "보통", "普通",
                 "普通");
