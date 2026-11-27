@@ -276,7 +276,52 @@ float PadAnalogProbe(const uint8_t* self, int index) {
     return v;
 }
 
+// The game's input mapping (df37 main+0x830400): every frame each pad channel is read, passed through a dead zone,
+// scaled and clamped to +-max, and written back; the parameters of entry i come from this getter (28-byte entries:
+// +0 channel, +4 paired channel or -1, +8 dead zone, +12 threshold, +16 scale, +20 max, +24 flag). The right stick
+// (channels 3 and 4) is clamped to max (1), which is why touch values past full tilt changed nothing. The swipe camera
+// test raises max to 4 for those two channels: only touch input goes past 1, so controllers are not affected. The
+// entries are logged once.
+struct MapEntryHook {
+    const char* build_id;
+    uint64_t getter;
+};
+const MapEntryHook kMapEntryHooks[] = {
+    {"5a797a3a", 0x821690},
+    {"6569410c", 0x819d28},
+    {"df3766a2", 0x81ccc0},
+};
+void InputMapEntry(const uint8_t* self, int i, int32_t* channel, float* dead_zone, int32_t* pair, float* threshold,
+                   float* scale, float* max, uint8_t* flag) {
+    const uint8_t* e = *reinterpret_cast<const uint8_t* const*>(self + 8) + int64_t(i) * 0x1c;
+    memcpy(channel, e + 0, 4);
+    memcpy(pair, e + 4, 4);
+    memcpy(dead_zone, e + 8, 4);
+    memcpy(threshold, e + 12, 4);
+    memcpy(scale, e + 16, 4);
+    memcpy(max, e + 20, 4);
+    *flag = e[24];
+    static std::atomic<uint64_t> logged{0};
+    if (i >= 0 && i < 64 && !(logged.fetch_or(1ull << i) & (1ull << i)))
+        LOGI("hooks", "input mapping %d: channel %d (pair %d), dead zone %.3f, threshold %.3f, scale %.3f, max %.3f, "
+             "flag %u", i, *channel, *pair, *dead_zone, *threshold, *scale, *max, *flag);
+    if ((*channel == 3 || *channel == 4) && *max >= 0.99f && *max < 4.0f) *max = 4.0f;
+}
+
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
+    for (const MapEntryHook& h : kMapEntryHooks) {
+        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+        // ldr x9,[x0,#8] / orr w10,wzr,#0x1c / smull x11,w1,w10 / ldr w9,[x9,x11]
+        const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.getter);
+        std::string err;
+        if (code[0] != 0xF9400409 || code[1] != 0x321E0BEA || code[2] != 0x9B2A7C2B)
+            LOGW("hooks", "input mapping getter not found at main+0x%lx", (unsigned long)h.getter);
+        else if (rt.main.HookFunction(h.getter, reinterpret_cast<void*>(&InputMapEntry), &err))
+            LOGI("hooks", "input mapping: right stick allowed past full tilt (touch swipe camera test)");
+        else
+            LOGW("hooks", "input mapping hook failed: %s", err.c_str());
+    }
+
     const PadProbe* p = nullptr;
     for (const PadProbe& c : kPadProbes)
         if (!strncmp(c.build_id, b.build_id, strlen(c.build_id))) p = &c;
