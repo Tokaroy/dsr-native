@@ -382,6 +382,16 @@ void TrapHandler(int sig, siginfo_t* si, void* ctx) {
     }
 }
 
+// Our own hooks touch the trapped pages first every frame (the action setter, the stick vector), which opened them
+// before any game reader got there: they close them again right after.
+void TrapRearm() {
+    if (!g_trap_on.load(std::memory_order_relaxed)) return;
+    for (auto& r : g_trap) {
+        const uintptr_t lo = r.lo.load(std::memory_order_relaxed);
+        if (lo) mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
+    }
+}
+
 // Moves a std::vector<float> (begin, end, capacity at `vec`) to a page of its own; its address, or 0.
 uintptr_t MoveToOwnPage(uint8_t* vec) {
     auto* p = reinterpret_cast<uintptr_t*>(vec);
@@ -434,7 +444,11 @@ void StartReadTrap(uint8_t* input) {
                      (unsigned long long)((v >> 28) & 0x0FFFFFFF), (unsigned long long)(v & 0x0FFFFFFF));
             }
         }
-        for (auto& r : g_trap) r.lo = 0;  // the moved arrays stay where they are
+        for (auto& r : g_trap) {  // the moved arrays stay where they are
+            const uintptr_t lo = r.lo.exchange(0);
+            if (lo) mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
+        }
+        g_trap_on = false;
         LOGI("hooks", "read trap: done, %d readers (%u faults, %u on actions 6 / 7)", g_trap_count.load(),
              g_trap_faults.load(), g_trap_camera.load());
     }).detach();
@@ -458,6 +472,7 @@ void ActionSet(uint8_t* self, int id, float v) {
              static_cast<void*>(self), *reinterpret_cast<void**>(self + 32));
 #if defined(__aarch64__)
     if (id == 6 && v != 0.0f) StartReadTrap(self);
+    TrapRearm();
 #endif
 }
 
@@ -485,6 +500,22 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
         if (m > 1.0f && dsr::input::TouchCameraTilt() <= 1.0f) m = 1.0f;
         rx = x / len * m;
         ry = y / len * m;
+    }
+#if defined(__aarch64__)
+    TrapRearm();
+#endif
+    {   // diagnostics: each caller (with its two actions) once, then the first time it gets past full tilt
+        const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        const uint64_t key = (uint64_t(ret) << 16) | (uint64_t(ix & 0xFF) << 8) | uint64_t(iy & 0xFF);
+        const bool past = len > 0.37f + 1.0f / 1.7241380214691162f + 0.05f;
+        std::lock_guard<std::mutex> lk(g_probe_mutex);
+        const bool first = g_probe_seen.size() < 128 && g_probe_seen.insert(key).second;
+        const bool first_past = past && g_probe_seen.size() < 128 && g_probe_seen.insert(key ^ 1ull << 63).second;
+        if ((first && len > 0.0f) || first_past)
+            LOGI("hooks", "stick vector: actions (%d, %d) for main+0x%lx: length %.3f -> %.3f (touch camera %.2f)",
+                 ix, iy, ret >= g_main_base && ret < g_main_end ? long(ret - g_main_base) : -1L, len,
+                 std::sqrt(rx * rx + ry * ry), dsr::input::TouchCameraTilt());
+        if (first && len == 0.0f) g_probe_seen.erase(key);  // log it once it has a value
     }
     uint32_t bx, by;
     memcpy(&bx, &rx, 4);
