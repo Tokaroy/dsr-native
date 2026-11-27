@@ -127,6 +127,22 @@ int64_t PollerSleep(int64_t ns) {
     return std::max(ns, kPollerSleepNs);
 }
 
+// The game's "AsyncApplet" thread polls in a loop of 0.5 ms sleeps the whole game (about 1500 wake-ups a second,
+// for applets that are rarely or never used here): a core is woken every half millisecond and never reaches its
+// low-power states, which adds to the heat players report. Its sleeps of under kAppletSleepNs are stretched to it
+// (about 250 wake-ups a second); a result it waits for comes at most that much later (once, e.g. after a keyboard).
+constexpr int64_t kAppletSleepNs = 4'000'000;
+int64_t AppletPollSleep(int64_t ns) {
+    thread_local int is_applet = -1;  // unknown, 0, 1
+    if (is_applet < 0) {
+        is_applet = t_current && t_current->name == "AsyncApplet";
+        if (is_applet)
+            LOGI(kTag, "'AsyncApplet': sleeps of under %.0f ms stretched to %.0f ms (fewer wake-ups: less power)",
+                 kAppletSleepNs / 1e6, kAppletSleepNs / 1e6);
+    }
+    return is_applet && ns > 0 && ns < kAppletSleepNs ? kAppletSleepNs : ns;
+}
+
 void* ThreadTrampoline(void* p) {
     auto* ht = static_cast<HostThread*>(p);
     t_current = ht;
@@ -462,6 +478,7 @@ HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t
     // grace period so a save being written finishes first.
     dsr::platform::WaitWhilePaused(3000);
     if (t_current && t_current->poller.load(std::memory_order_relaxed)) ns = PollerSleep(ns);
+    else ns = dsr::hle::os::AppletPollSleep(ns);
     if (ns <= 0) {
         sched_yield();
         return;
