@@ -529,6 +529,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "compositor_scaling")) cfg->compositor_scaling = v != 0;
             else if (!strcmp(key, "max_anisotropy")) cfg->max_anisotropy = v;
             else if (!strcmp(key, "geo_cache_mb")) cfg->geo_cache_mb = std::clamp(v, 32, 512);
+            else if (!strcmp(key, "geo_watch")) cfg->geo_watch = v != 0;
             else if (!strcmp(key, "anisotropy")) cfg->anisotropy = v < 0 ? -1 : std::min(v, 16);
             else if (!strcmp(key, "shadow_compare")) cfg->shadow_compare = std::clamp(v, 0, 3);
             else if (!strcmp(key, "game_hooks")) cfg->game_hooks = v != 0;
@@ -690,9 +691,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          cfg->hole_test);
     // The newer graphics settings (one line, so a report shows what was tried).
     LOGI(kTag, "settings: sharp_hud %d, fsr %d (half %d), fxaa %d, shadow_quality %d, anisotropy %d, skip_hidden %d, skip_prepass %d, "
-         "bc_astc %d, astc_block %d, mali_bc %d, bc3_etc2 %d, tex_cache_mb %d, geo_cache_mb %d, performance_mode %d, late_depth %d",
+         "bc_astc %d, astc_block %d, mali_bc %d, bc3_etc2 %d, tex_cache_mb %d, geo_cache_mb %d, geo_watch %d, performance_mode %d, late_depth %d",
          int(cfg->sharp_hud), int(cfg->fsr), int(cfg->fsr_half), cfg->fxaa, cfg->shadow_quality, cfg->anisotropy, cfg->skip_hidden,
-         int(cfg->skip_prepass), int(cfg->bc_astc), cfg->astc_block, cfg->mali_bc, int(cfg->bc3_etc2), cfg->tex_cache_mb, cfg->geo_cache_mb,
+         int(cfg->skip_prepass), int(cfg->bc_astc), cfg->astc_block, cfg->mali_bc, int(cfg->bc3_etc2), cfg->tex_cache_mb, cfg->geo_cache_mb, int(cfg->geo_watch),
          int(cfg->performance_mode), int(cfg->late_depth));
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",

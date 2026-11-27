@@ -57,6 +57,7 @@
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/os/os.h"
+#include "hle/os/write_watch.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/nvn/tex_disk_cache.h"
 #include "hle/nvn/state.h"
@@ -7339,7 +7340,24 @@ private:
                                     // while the list runs, so later draws of the same range skip the hash
         const uint8_t* src = nullptr;  // the range (for hashing ahead)
         size_t size = 0;
+        // Write tracking (geo_watch, hle/os/write_watch.h): the epoch the range's pages were protected at (0 = not
+        // watched), the hash of its partial first / last pages (never protected), and how many lists in a row
+        // its hash came out the same.
+        uint64_t watch = 0;
+        uint64_t edge_hash = 0;
+        uint32_t stable = 0;
     };
+    // Hash of the parts of a range the write tracking does not protect (its partial first and last pages).
+    static uint64_t EdgeHash(const uint8_t* src, size_t size) {
+        os::WatchEdge e[2];
+        int n = 0;
+        os::WatchEdges(src, size, e, &n);
+        uint64_t h = 0x84222325cbf29ce4ull;
+        for (int i = 0; i < n; i++) h = (h ^ GeoHash(src + e[i].off, e[i].len)) * 0x100000001B3ull;
+        return h;
+    }
+    uint64_t watch_hits_ = 0, watch_hit_bytes_ = 0, watch_armed_ = 0, watch_lost_ = 0, geo_hashed_bytes_ = 0;
+    std::atomic<uint64_t> prehash_bytes_{0};
     // Hashing ahead: at the start of a list, the ranges the previous list used (almost all of them are used
     // again) are hashed on worker threads while the render thread works; GeoCached takes a finished result
     // instead of hashing on the render thread (content hashing was ~15% of the render thread).
@@ -7364,6 +7382,7 @@ private:
     uint64_t prehash_used_ = 0, prehash_inline_ = 0, stat_lists_ = 0;
     static constexpr size_t kNoMoreJobs = SIZE_MAX / 2;
     void PrehashWorker() {
+        dsr::profiler::RegisterCurrentThread("dsr-prehash");
         uint64_t seen = 0;
         for (;;) {
             {
@@ -7378,6 +7397,7 @@ private:
                 if (i >= prehash_count_.load()) break;
                 PrehashJob& j = prehash_jobs_[i];
                 j.hash = GuestRangeValid(uint64_t(uintptr_t(j.src)), j.size) ? GeoHash(j.src, j.size) : 0;
+                prehash_bytes_.fetch_add(j.size, std::memory_order_relaxed);
                 j.done.store(true, std::memory_order_release);
             }
             prehash_active_.fetch_sub(1);
@@ -7524,6 +7544,22 @@ private:
             geo_hits_++;
             return it->off;
         }
+        // Watched (geo_watch): no write reached its protected pages since it was armed, and its unprotected edges
+        // hash the same: unchanged without hashing it (nor hashing it ahead next list).
+        if (it && it->watch) {
+            if (os::WatchClean(src, size, it->watch) && EdgeHash(src, size) == it->edge_hash) {
+                geo_hits_++;
+                watch_hits_++;
+                watch_hit_bytes_ += size;
+                it->checked_list = geo_token_;
+                geo_lo_ = std::min(geo_lo_, reinterpret_cast<uintptr_t>(src));
+                geo_hi_ = std::max(geo_hi_, reinterpret_cast<uintptr_t>(src) + size);
+                return it->off;
+            }
+            it->watch = 0;  // written (or released): checked by its hash below
+            it->stable = 0;
+            watch_lost_++;
+        }
         geo_used_now_.push_back(key);
         geo_lo_ = std::min(geo_lo_, reinterpret_cast<uintptr_t>(src));
         geo_hi_ = std::max(geo_hi_, reinterpret_cast<uintptr_t>(src) + size);
@@ -7538,7 +7574,23 @@ private:
             prehash_used_++;
         } else {
             h = GeoHash(src, size);
+            geo_hashed_bytes_ += size;
             prehash_inline_++;
+        }
+        // The same three lists in a row: watched from now on. Its pages are protected first and the range hashed
+        // once more after (a write landing while they were being protected is not seen by the fault handler).
+        if (it && it->hash == h && ++it->stable >= 3 && size >= 8192 && os::WatchEnabled()) {
+            const uint64_t epoch = os::WatchArm(src, size);
+            it->stable = 0;  // not armed (too small for whole pages, pages written too often): tried again later
+            if (epoch) {
+                h = GeoHash(src, size);
+                geo_hashed_bytes_ += size;
+                if (h == it->hash) {
+                    it->watch = epoch;
+                    it->edge_hash = EdgeHash(src, size);
+                    watch_armed_++;
+                }
+            }
         }
         if (it && it->hash == h) {
             geo_hits_++;
@@ -7866,6 +7918,21 @@ private:
                  (unsigned long long)geo_volatile_, geo_off_ / 1048576.0, (unsigned long long)(geo_size_ >> 20),
                  (unsigned long long)geo_resets_);
             geo_hits_ = geo_misses_ = geo_bytes_ = geo_volatile_ = 0;
+            const uint64_t pre_bytes = prehash_bytes_.exchange(0);
+            if (os::WatchEnabled()) {
+                const os::WatchStats ws = os::WatchTakeStats();
+                LOGI(kTag, "geometry write tracking: %llu uses unchanged without hashing (%.0f MB), %llu ranges watched "
+                     "from now on, %llu written since, %llu write faults, %llu pages protected, %llu pages too busy "
+                     "to watch | hashed: %.0f MB on the render thread, %.0f MB ahead (last 10 s)",
+                     (unsigned long long)watch_hits_, watch_hit_bytes_ / 1048576.0, (unsigned long long)watch_armed_,
+                     (unsigned long long)watch_lost_, (unsigned long long)ws.faults,
+                     (unsigned long long)ws.armed_pages, (unsigned long long)ws.busy_pages,
+                     geo_hashed_bytes_ / 1048576.0, pre_bytes / 1048576.0);
+            } else {
+                LOGI(kTag, "geometry hashed: %.0f MB on the render thread, %.0f MB ahead (last 10 s)",
+                     geo_hashed_bytes_ / 1048576.0, pre_bytes / 1048576.0);
+            }
+            watch_hits_ = watch_hit_bytes_ = watch_armed_ = watch_lost_ = geo_hashed_bytes_ = 0;
         }
         std::string phases;
         for (int i = 0; i < 7; i++) {

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/log.h"
+#include "hle/os/write_watch.h"
 #include "hle/registry.h"
 #include "runtime/runtime.h"
 
@@ -177,6 +178,8 @@ static void LogReadFailure(const HostFile* f, int64_t off, size_t size, size_t d
 }
 static uint32_t ReadImpl(size_t* out, HostFile* f, int64_t off, void* buf, size_t size, bool must_fill) {
     size_t done = 0;
+    // The kernel writing a page the write tracking made read-only fails (EFAULT) instead of faulting.
+    dsr::hle::os::WatchBeforeWrite(buf, size);
     int eio_retries = 0;
     while (done < size) {
         ssize_t r = pread(f->fd, static_cast<char*>(buf) + done, size - done, off + int64_t(done));

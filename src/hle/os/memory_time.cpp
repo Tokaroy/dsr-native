@@ -11,6 +11,7 @@
 #include "common/log.h"
 #include "hle/os/heap.h"
 #include "hle/os/os.h"
+#include "hle/os/write_watch.h"
 #include "hle/registry.h"
 
 namespace dsr::hle::os {
@@ -71,6 +72,7 @@ HLE_FUNC(_ZN2nn2os17SetMemoryHeapSizeEm, uint32_t, nn_os_SetMemoryHeapSize, (siz
         // Align base to the block unit so block addresses match Switch alignment expectations.
         uintptr_t b = AlignUp(reinterpret_cast<uintptr_t>(p), kBlockUnit);
         g_heap_base = b;
+        WatchSetHeap(b, kHeapReserve - kBlockUnit);
     }
     if (size > kHeapReserve - kBlockUnit) return kResultOutOfMemory;
     if (size > g_heap_size) {
@@ -114,7 +116,9 @@ HLE_FUNC(_ZN2nn2os15FreeMemoryBlockEmm, void, nn_os_FreeMemoryBlock, (uintptr_t 
     }
     (void)size;
     g_used_bytes -= it->second;
-    // Give the pages back to the OS but keep the range mapped.
+    // Give the pages back to the OS but keep the range mapped (they read as zeros: a change the write tracking
+    // cannot see).
+    WatchBeforeWrite(reinterpret_cast<void*>(addr), it->second);
     madvise(reinterpret_cast<void*>(addr), it->second, MADV_DONTNEED);
     InsertFree(addr, it->second);
     g_used.erase(it);

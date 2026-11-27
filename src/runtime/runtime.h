@@ -155,6 +155,9 @@ struct RuntimeConfig {
     // data kept on the GPU across frames), 32-512 MB. Smaller uses less RAM but fills sooner (emptied and refilled: a
     // short stall). Performance mode sets 64.
     int geo_cache_mb = 192;
+    // geo_watch: geometry ranges that stayed the same are watched for writes (page protection, hle/os/write_watch.h)
+    // instead of being hashed again every frame; 0 = hash them every frame as before.
+    bool geo_watch = true;
     int max_anisotropy = 0;  // limit on the game's anisotropic texture filtering (0 = the game's own level)
     // anisotropy (settings menu "Anisotropic filtering"): -1 = as the game asks, 0 = off, 2 / 4 / 8 / 16 = that level on
     // every mipmapped, linearly filtered texture (capped at the GPU's limit). Sharper textures at grazing angles
