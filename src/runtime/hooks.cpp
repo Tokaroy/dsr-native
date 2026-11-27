@@ -493,6 +493,53 @@ const StickVecHook kStickVecHooks[] = {
     {"6569410c", 0x694d50},
     {"df3766a2", 0x694d20},
 };
+// Camera diagnostics: once a second while the touch camera is past full tilt, the most it sent, the most the camera's
+// stick vector (actions 18 / 19) saw and gave, and the most the turn getters (below) read and returned.
+std::mutex g_cam_mutex;
+float g_cam_max[6];  // touch, vector in, vector out, action 26 in, turn out, callers seen
+std::chrono::steady_clock::time_point g_cam_next;
+void CamNote(int i, float v) {
+    std::lock_guard<std::mutex> lk(g_cam_mutex);
+    g_cam_max[i] = std::max(g_cam_max[i], std::fabs(v));
+    g_cam_max[0] = std::max(g_cam_max[0], dsr::input::TouchCameraTilt());
+    const auto now = std::chrono::steady_clock::now();
+    if (now < g_cam_next) return;
+    g_cam_next = now + std::chrono::seconds(1);
+    if (g_cam_max[0] > 1.0f)
+        LOGI("hooks", "camera: last second most: touch %.2f, stick vector (18, 19) %.2f -> %.2f, action 26/27 %.2f -> "
+             "turn %.4f", g_cam_max[0], g_cam_max[1], g_cam_max[2], g_cam_max[3], g_cam_max[4]);
+    for (float& m : g_cam_max) m = 0.0f;
+}
+
+// The camera's turn getters (df37 main+0x6887ac / 0x6887d4): action 26 (27) times 1.5 degrees (minus), read straight
+// from the published array. Same code that logs each caller once and feeds the camera diagnostics.
+struct TurnHook {
+    const char* build_id;
+    uint64_t fn[2];
+};
+const TurnHook kTurnHooks[] = {{"df3766a2", {0x6887ac, 0x6887d4}}};
+float g_turn_scale[2] = {0.02617994f, -0.02617994f};
+template <int K>
+float TurnGetter(const uint8_t* self) {
+    const uint8_t* input = *reinterpret_cast<const uint8_t* const*>(self + 8);
+    const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(input + 8) + 32);
+    const float v = a[26 + K];
+    const float r = v * g_turn_scale[K];
+#if defined(__aarch64__)
+    TrapRearm();
+#endif
+    const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    {
+        std::lock_guard<std::mutex> lk(g_probe_mutex);
+        if (v != 0.0f && g_probe_seen.size() < 128 && g_probe_seen.insert((uint64_t(ret) << 1) | 1ull << 62 | K).second)
+            LOGI("hooks", "camera turn getter %d: called from main+0x%lx (action %.3f -> %.4f)", K,
+                 ret >= g_main_base && ret < g_main_end ? long(ret - g_main_base) : -1L, v, r);
+    }
+    CamNote(3, v);
+    CamNote(4, r);
+    return r;
+}
+
 uint64_t StickVector(const uint8_t* self, int ix, int iy) {
     const float* a = *reinterpret_cast<const float* const*>(*reinterpret_cast<const uint8_t* const*>(self + 8) + 32);
     const float x = a[ix], y = a[iy];
@@ -520,6 +567,10 @@ uint64_t StickVector(const uint8_t* self, int ix, int iy) {
                  std::sqrt(rx * rx + ry * ry), dsr::input::TouchCameraTilt());
         if (first && len == 0.0f) g_probe_seen.erase(key);  // log it once it has a value
     }
+    if (ix == 18) {
+        CamNote(1, len);
+        CamNote(2, std::sqrt(rx * rx + ry * ry));
+    }
     uint32_t bx, by;
     memcpy(&bx, &rx, 4);
     memcpy(&by, &ry, 4);
@@ -540,6 +591,29 @@ static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
             LOGI("hooks", "swipe camera: the camera turns past the stick's top speed for fast swipes");
         else
             LOGW("hooks", "stick vector hook failed: %s", err.c_str());
+    }
+
+    for (const TurnHook& h : kTurnHooks) {
+        if (strncmp(h.build_id, b.build_id, strlen(h.build_id))) continue;
+        for (int k = 0; k < 2; k++) {
+            // ldr x0,[x0,#8] / mov w1,#26+k / bl / adrp / ldr s1 / fmul s0,s0,s1
+            const uint32_t* code = reinterpret_cast<const uint32_t*>(rt.main.base() + h.fn[k]);
+            if (code[2] != 0xF9400400 || code[3] != 0x52800341u + (uint32_t(k) << 5) || code[7] != 0x1E210800) {
+                LOGW("hooks", "camera turn getter %d not found at main+0x%lx", k, (unsigned long)h.fn[k]);
+                continue;
+            }
+            // the scale: adrp (page) + ldr s1, [x8, #imm]
+            const uint64_t at = h.fn[k] + 20;
+            const uint32_t adrp = code[5], ldr = code[6];
+            const int64_t imm = int64_t((((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3)) << 44 >> 32;
+            const uint64_t page = (at & ~0xFFFull) + uint64_t(imm);
+            memcpy(&g_turn_scale[k], reinterpret_cast<const void*>(rt.main.base() + page + ((ldr >> 10) & 0xFFF) * 4), 4);
+            std::string err;
+            if (rt.main.HookFunction(h.fn[k], reinterpret_cast<void*>(k ? &TurnGetter<1> : &TurnGetter<0>), &err))
+                LOGI("hooks", "camera turn getter %d: probe (scale %.5f)", k, g_turn_scale[k]);
+            else
+                LOGW("hooks", "camera turn getter %d hook failed: %s", k, err.c_str());
+        }
     }
 
     for (const ActionSetHook& h : kActionSetHooks) {
