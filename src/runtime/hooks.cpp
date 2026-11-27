@@ -3,6 +3,9 @@
 // version with different programs). They replace engine functions whose output is useful to us but goes
 // nowhere in a retail build, and patch the frame rate and resolution. The places were found in 1.0.0 and matched
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
+#include <ucontext.h>
+#include <sys/mman.h>
+#include <signal.h>
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
@@ -322,6 +325,87 @@ const ActionSetHook kActionSetHooks[] = {
     {"5a797a3a", 0x8312d0},
     {"df3766a2", 0x82c900},
 };
+// Read trap (diagnostics): the camera reads the right stick's actions (6 / 7 while walking) from the array the input
+// layer publishes, through code no probe sees. For 10 s after the camera first turns, the page holding that array
+// is made inaccessible every 2 ms; an access faults, the handler notes the instruction (and its caller) if it touched
+// the camera entries, opens the page again and lets the instruction run. Each new reader is logged (32 at most).
+#if defined(__aarch64__)
+std::atomic<uintptr_t> g_trap_page{0};
+std::atomic<uintptr_t> g_trap_lo{0}, g_trap_hi{0};
+std::atomic<bool> g_trap_on{false};
+struct sigaction g_trap_old;
+size_t g_trap_page_size = 4096;
+std::atomic<int> g_trap_count{0};
+uint64_t g_trap_seen[32];
+std::atomic<uint64_t> g_trap_pending[32];  // pc << 32 ^ lr, logged by the re-arm thread (no logging in a handler)
+
+void TrapHandler(int sig, siginfo_t* si, void* ctx) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
+    const uintptr_t page = g_trap_page.load(std::memory_order_relaxed);
+    if (page && a >= page && a < page + g_trap_page_size) {
+        mprotect(reinterpret_cast<void*>(page), g_trap_page_size, PROT_READ | PROT_WRITE);
+        if (a >= g_trap_lo.load(std::memory_order_relaxed) && a < g_trap_hi.load(std::memory_order_relaxed)) {
+            auto* uc = static_cast<ucontext_t*>(ctx);
+            const uint64_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30];
+            const uint64_t key = ((pc - g_main_base) << 32) ^ ((lr - g_main_base) & 0xFFFFFFFFull) ^ (a & 0xF);
+            int n = g_trap_count.load(std::memory_order_relaxed);
+            bool seen = false;
+            for (int i = 0; i < n && i < 32; i++) seen |= g_trap_seen[i] == key;
+            if (!seen && n < 32) {
+                g_trap_seen[n] = key;
+                g_trap_pending[n].store(((pc - g_main_base) << 32) | ((lr - g_main_base) & 0xFFFFFFFFull) |
+                                        (uint64_t(a - g_trap_lo.load()) << 60), std::memory_order_relaxed);
+                g_trap_count.store(n + 1, std::memory_order_release);
+            }
+        }
+        return;
+    }
+    // Not ours: the previous handler (the crash handler).
+    if (g_trap_old.sa_flags & SA_SIGINFO) {
+        if (g_trap_old.sa_sigaction) g_trap_old.sa_sigaction(sig, si, ctx);
+    } else if (g_trap_old.sa_handler != SIG_DFL && g_trap_old.sa_handler != SIG_IGN) {
+        g_trap_old.sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+void StartReadTrap(uintptr_t array) {
+    bool expected = false;
+    if (!g_trap_on.compare_exchange_strong(expected, true)) return;
+    g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
+    const uintptr_t lo = array + 6 * 4, hi = array + 8 * 4;  // actions 6 and 7
+    g_trap_lo = lo;
+    g_trap_hi = hi;
+    g_trap_page = lo & ~(uintptr_t(g_trap_page_size) - 1);
+    struct sigaction sa {};
+    sa.sa_sigaction = TrapHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_trap_old);
+    std::thread([] {
+        LOGI("hooks", "read trap: watching the camera's actions for 10 s");
+        int logged = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < end) {
+            mprotect(reinterpret_cast<void*>(g_trap_page.load()), g_trap_page_size, PROT_NONE);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            mprotect(reinterpret_cast<void*>(g_trap_page.load()), g_trap_page_size, PROT_READ | PROT_WRITE);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            const int n = g_trap_count.load(std::memory_order_acquire);
+            for (; logged < n; logged++) {
+                const uint64_t v = g_trap_pending[logged].load(std::memory_order_relaxed);
+                LOGI("hooks", "read trap: action %d read at main+0x%llx (return main+0x%llx)", 6 + int(v >> 62),
+                     (unsigned long long)((v >> 32) & 0x0FFFFFFF), (unsigned long long)(v & 0xFFFFFFFF));
+            }
+        }
+        g_trap_page = 0;
+        LOGI("hooks", "read trap: done, %d readers", g_trap_count.load());
+    }).detach();
+}
+#endif
+
 void ActionSet(uint8_t* self, int id, float v) {
     float* pos = *reinterpret_cast<float**>(self + 208);
     float* neg = *reinterpret_cast<float**>(self + 248);
@@ -337,6 +421,9 @@ void ActionSet(uint8_t* self, int id, float v) {
     if (v != 0.0f && id >= 0 && id < 128 && !(logged[id >> 6].fetch_or(1ull << (id & 63)) & (1ull << (id & 63))))
         LOGI("hooks", "input action %d: first value %.3f (input object @%p, read array @%p)", id, v,
              static_cast<void*>(self), *reinterpret_cast<void**>(self + 32));
+#if defined(__aarch64__)
+    if (id == 6 && v != 0.0f) StartReadTrap(*reinterpret_cast<uintptr_t*>(self + 32));
+#endif
 }
 
 static void InstallCameraInputProbe(Runtime& rt, const GameBuild& b) {
