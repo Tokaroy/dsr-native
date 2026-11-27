@@ -1952,8 +1952,16 @@ private:
                      rh, target_h);
             }
         }
+        // Samsung Xclipse (AMD RDNA based, Galaxy A55's Xclipse 530, driver 24.0): with dynamic rendering, depth
+        // was only written in the top-left part of the screen, the size of the previous depth target (the depth
+        // pre-pass and main pass at 1280x720 kept depth only where x < 640 and y < 360 after 640x360 depth passes),
+        // so fog, ambient occlusion and lighting were wrong over the rest. Render pass objects fix it (tester).
+        const bool xclipse = props_.vendorID == 0x144D || strstr(props_.deviceName, "Xclipse") != nullptr;
         if (en13.dynamicRendering && dsr::GetRuntime().config.render_pass_objects)
             LOGI(kTag, "settings render_pass_objects = 1: render pass objects instead of the driver's dynamic rendering");
+        else if (en13.dynamicRendering && xclipse)
+            LOGI(kTag, "Samsung Xclipse: render pass objects instead of the driver's dynamic rendering (depth was "
+                       "only written in part of the screen with it)");
         else if (en13.dynamicRendering) {
             begin_rendering_ = reinterpret_cast<PFN_vkCmdBeginRendering>(vkGetDeviceProcAddr(device_, "vkCmdBeginRendering"));
             end_rendering_ = reinterpret_cast<PFN_vkCmdEndRendering>(vkGetDeviceProcAddr(device_, "vkCmdEndRendering"));
