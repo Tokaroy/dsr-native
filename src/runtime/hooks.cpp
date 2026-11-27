@@ -327,47 +327,46 @@ const ActionSetHook kActionSetHooks[] = {
     {"df3766a2", 0x82c900},
 };
 // Read trap (diagnostics): the camera reads the right stick's actions (6 / 7 while walking) through code no hook sees.
-// For 10 s after the camera first turns, the pages holding the input object's arrays (the frame sums at +328 and the
-// published copy at +32) are made inaccessible every 2 ms; an access faults, the handler notes the instruction (and
-// its return address) when it touched actions 6 / 7 of either array, opens the page again and lets the instruction
-// run. Each new reader is logged (32 at most), with counts of all faults, to show the trap works.
+// A trap on the arrays' own pages caught nothing (any access to the page opened it, and those pages are busy), so the
+// input object's two action arrays (the frame sums, std::vector at +328, and the published copy at +32) are moved to
+// pages of their own: copied, and the vectors pointed at the copies (their sizes do not change after start-up). For
+// 10 s after the camera first turns, those pages are made inaccessible every 2 ms; an access faults, the handler notes
+// the instruction, its return address and the action index, opens the page and lets the instruction run. Each new
+// reader is logged (48 at most), then the counts.
 #if defined(__aarch64__)
 struct TrapRange {
-    std::atomic<uintptr_t> page{0}, lo{0}, hi{0};
+    std::atomic<uintptr_t> lo{0}, hi{0};
 };
 TrapRange g_trap[2];
-std::atomic<bool> g_trap_on{false};
+std::atomic<bool> g_trap_on{false}, g_trap_armed{false};
 struct sigaction g_trap_old;
 size_t g_trap_page_size = 4096;
 std::atomic<int> g_trap_count{0};
-std::atomic<uint32_t> g_trap_faults{0}, g_trap_hits{0};
-uint64_t g_trap_seen[32];
-std::atomic<uint64_t> g_trap_pending[32];  // which << 62 | pc offset << 32 | lr offset, logged by the re-arm thread
+std::atomic<uint32_t> g_trap_faults{0}, g_trap_camera{0};
+uint64_t g_trap_seen[48];
+std::atomic<uint64_t> g_trap_pending[48];  // array << 63 | index << 56 | pc offset << 28 | lr offset
 
 void TrapHandler(int sig, siginfo_t* si, void* ctx) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
-    for (int r = 0; r < 2; r++) {
-        const uintptr_t page = g_trap[r].page.load(std::memory_order_relaxed);
-        if (!page || a < page || a >= page + g_trap_page_size) continue;
-        mprotect(reinterpret_cast<void*>(page), g_trap_page_size, PROT_READ | PROT_WRITE);
+    for (int w = 0; w < 2; w++) {
+        const uintptr_t lo = g_trap[w].lo.load(std::memory_order_relaxed);
+        if (!lo || a < lo || a >= lo + g_trap_page_size) continue;
+        mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
         g_trap_faults.fetch_add(1, std::memory_order_relaxed);
-        for (int w = 0; w < 2; w++) {
-            if (a < g_trap[w].lo.load(std::memory_order_relaxed) || a >= g_trap[w].hi.load(std::memory_order_relaxed))
-                continue;
-            g_trap_hits.fetch_add(1, std::memory_order_relaxed);
-            auto* uc = static_cast<ucontext_t*>(ctx);
-            if (uc->uc_mcontext.pc < g_main_base || uc->uc_mcontext.pc >= g_main_end) continue;  // our own code
-            const uint64_t pc = (uc->uc_mcontext.pc - g_main_base) & 0x0FFFFFFF;
-            const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0xFFFFFFFF;
-            const uint64_t key = (uint64_t(w) << 62) | (pc << 32) | lr;
-            const int n = g_trap_count.load(std::memory_order_relaxed);
-            bool seen = false;
-            for (int i = 0; i < n && i < 32; i++) seen |= g_trap_seen[i] == key;
-            if (!seen && n < 32) {
-                g_trap_seen[n] = key;
-                g_trap_pending[n].store(key, std::memory_order_relaxed);
-                g_trap_count.store(n + 1, std::memory_order_release);
-            }
+        const uint64_t index = (a - lo) / 4;
+        if (index == 6 || index == 7) g_trap_camera.fetch_add(1, std::memory_order_relaxed);
+        auto* uc = static_cast<ucontext_t*>(ctx);
+        if (uc->uc_mcontext.pc < g_main_base || uc->uc_mcontext.pc >= g_main_end) return;  // our own code
+        const uint64_t pc = (uc->uc_mcontext.pc - g_main_base) & 0x0FFFFFFF;
+        const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
+        const uint64_t key = (uint64_t(w) << 63) | ((index & 0x7F) << 56) | (pc << 28) | lr;
+        const int n = g_trap_count.load(std::memory_order_relaxed);
+        bool seen = false;
+        for (int i = 0; i < n && i < 48; i++) seen |= g_trap_seen[i] == key;
+        if (!seen && n < 48) {
+            g_trap_seen[n] = key;
+            g_trap_pending[n].store(key, std::memory_order_relaxed);
+            g_trap_count.store(n + 1, std::memory_order_release);
         }
         return;
     }
@@ -382,48 +381,61 @@ void TrapHandler(int sig, siginfo_t* si, void* ctx) {
     }
 }
 
-void StartReadTrap(const uint8_t* input) {
+// Moves a std::vector<float> (begin, end, capacity at `vec`) to a page of its own; its address, or 0.
+uintptr_t MoveToOwnPage(uint8_t* vec) {
+    auto* p = reinterpret_cast<uintptr_t*>(vec);
+    const uintptr_t begin = p[0], endp = p[1];
+    const size_t bytes = endp - begin;
+    if (!begin || endp < begin || bytes == 0 || bytes > g_trap_page_size) return 0;
+    void* page = mmap(nullptr, g_trap_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 0;
+    memcpy(page, reinterpret_cast<const void*>(begin), bytes);
+    const uintptr_t np = reinterpret_cast<uintptr_t>(page);
+    p[0] = np;
+    p[1] = np + bytes;
+    p[2] = np + bytes;
+    return np;
+}
+
+void StartReadTrap(uint8_t* input) {
     bool expected = false;
     if (!g_trap_on.compare_exchange_strong(expected, true)) return;
     g_trap_page_size = size_t(sysconf(_SC_PAGESIZE));
-    const uintptr_t arrays[2] = {*reinterpret_cast<const uintptr_t*>(input + 328),
-                                 *reinterpret_cast<const uintptr_t*>(input + 32)};
-    for (int w = 0; w < 2; w++) {
-        g_trap[w].lo = arrays[w] + 6 * 4;
-        g_trap[w].hi = arrays[w] + 8 * 4;
-        g_trap[w].page = (arrays[w] + 6 * 4) & ~(uintptr_t(g_trap_page_size) - 1);
-    }
-    if (g_trap[1].page.load() == g_trap[0].page.load()) g_trap[1].page = 0;  // one page holds both
+    const size_t n_sums = (*reinterpret_cast<uintptr_t*>(input + 336) - *reinterpret_cast<uintptr_t*>(input + 328)) / 4;
+    const size_t n_copy = (*reinterpret_cast<uintptr_t*>(input + 40) - *reinterpret_cast<uintptr_t*>(input + 32)) / 4;
+    const uintptr_t sums = MoveToOwnPage(input + 328), copy = MoveToOwnPage(input + 32);
+    LOGI("hooks", "read trap: action arrays moved to their own pages: sums (%zu) %s, copy (%zu) %s", n_sums,
+         sums ? "ok" : "not moved", n_copy, copy ? "ok" : "not moved");
+    g_trap[0].lo = sums;
+    g_trap[1].lo = copy;
     struct sigaction sa {};
     sa.sa_sigaction = TrapHandler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, &g_trap_old);
-    std::thread([arrays] {
-        LOGI("hooks", "read trap: watching actions 6 / 7 of the sums @0x%lx and the copy @0x%lx for 10 s",
-             (unsigned long)arrays[0], (unsigned long)arrays[1]);
+    std::thread([] {
         int logged = 0, fails = 0;
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (std::chrono::steady_clock::now() < end) {
             for (auto& r : g_trap)
-                if (r.page && mprotect(reinterpret_cast<void*>(r.page.load()), g_trap_page_size, PROT_NONE) != 0 &&
+                if (r.lo && mprotect(reinterpret_cast<void*>(r.lo.load()), g_trap_page_size, PROT_NONE) != 0 &&
                     fails++ == 0)
                     LOGW("hooks", "read trap: mprotect failed (%s)", strerror(errno));
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             for (auto& r : g_trap)
-                if (r.page) mprotect(reinterpret_cast<void*>(r.page.load()), g_trap_page_size, PROT_READ | PROT_WRITE);
+                if (r.lo) mprotect(reinterpret_cast<void*>(r.lo.load()), g_trap_page_size, PROT_READ | PROT_WRITE);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
             const int n = g_trap_count.load(std::memory_order_acquire);
             for (; logged < n; logged++) {
                 const uint64_t v = g_trap_pending[logged].load(std::memory_order_relaxed);
-                LOGI("hooks", "read trap: camera action read (%s) at main+0x%llx (return main+0x%llx)",
-                     (v >> 62) ? "published copy" : "frame sums", (unsigned long long)((v >> 32) & 0x0FFFFFFF),
-                     (unsigned long long)(v & 0xFFFFFFFF));
+                LOGI("hooks", "read trap: action %d of the %s read at main+0x%llx (return main+0x%llx)",
+                     int((v >> 56) & 0x7F), (v >> 63) ? "published copy" : "frame sums",
+                     (unsigned long long)((v >> 28) & 0x0FFFFFFF), (unsigned long long)(v & 0x0FFFFFFF));
             }
         }
-        for (auto& r : g_trap) r.page = 0;
-        LOGI("hooks", "read trap: done, %d readers (%u faults on the pages, %u on actions 6 / 7)", g_trap_count.load(),
-             g_trap_faults.load(), g_trap_hits.load());
+        for (auto& r : g_trap) r.lo = 0;  // the moved arrays stay where they are
+        LOGI("hooks", "read trap: done, %d readers (%u faults, %u on actions 6 / 7)", g_trap_count.load(),
+             g_trap_faults.load(), g_trap_camera.load());
     }).detach();
 }
 #endif
