@@ -5,6 +5,9 @@
 // in 1.0.3 by their code (the same instructions around them, with addresses masked).
 #include <cerrno>
 #include <ucontext.h>
+#if defined(__aarch64__)
+#include <asm/sigcontext.h>
+#endif
 #include <sys/mman.h>
 #include <signal.h>
 #include <unordered_set>
@@ -390,6 +393,156 @@ std::atomic<uint32_t> g_cam_trap_faults{0}, g_cam_trap_hits{0};
 uint64_t g_cam_trap_seen[32];
 std::atomic<uint64_t> g_cam_trap_pending[32];  // offset << 56 | pc offset << 28 | lr offset
 
+// The camera input's page is busy (the rest of the object), so waiting for the first access after re-arming rarely
+// caught the reader. Instead the faulting load or store is carried out here (the common addressing forms) and the
+// page stays closed: every access is seen. Other forms open the page until the next re-arm.
+__uint128_t* TrapFpRegs(ucontext_t* uc) {
+    uint8_t* p = reinterpret_cast<uint8_t*>(uc->uc_mcontext.__reserved);
+    for (size_t off = 0; off + sizeof(_aarch64_ctx) <= sizeof(uc->uc_mcontext.__reserved);) {
+        auto* h = reinterpret_cast<_aarch64_ctx*>(p + off);
+        if (h->magic == 0 || h->size == 0) break;
+        if (h->magic == FPSIMD_MAGIC) return reinterpret_cast<fpsimd_context*>(h)->vregs;
+        off += h->size;
+    }
+    return nullptr;
+}
+struct TrapAccess {
+    uintptr_t addr = 0;
+    unsigned bytes = 0, count = 1;  // count 2: a pair
+    bool load = false, fp = false;
+    int sext = 0;  // 32 / 64: sign-extending load
+    int rt = 0, rt2 = 0;
+    int wb_reg = -1;  // writeback base
+    uintptr_t wb_value = 0;
+};
+bool TrapDecode(const ucontext_t* uc, uint32_t w, TrapAccess* t) {
+    const auto& mc = uc->uc_mcontext;
+    auto base = [&](int r) -> uint64_t { return r == 31 ? mc.sp : mc.regs[r]; };
+    auto reg = [&](int r) -> uint64_t { return r == 31 ? 0 : mc.regs[r]; };
+    const int rn = (w >> 5) & 31;
+    t->rt = w & 31;
+    const unsigned size = w >> 30, v = (w >> 26) & 1;
+    auto single = [&](unsigned opc) -> bool {
+        if (v) {
+            if (opc >= 2) {
+                if (size) return false;
+                t->bytes = 16;
+                t->load = opc == 3;
+            } else {
+                t->bytes = 1u << size;
+                t->load = opc == 1;
+            }
+            t->fp = true;
+        } else {
+            t->bytes = 1u << size;
+            t->load = opc != 0;
+            if (opc == 2) {
+                if (size == 3) return false;  // prefetch
+                t->sext = 64;
+            } else if (opc == 3) {
+                if (size >= 2) return false;
+                t->sext = 32;
+            }
+        }
+        return true;
+    };
+    if ((w & 0x3B000000) == 0x39000000) {  // unsigned offset
+        if (!single((w >> 22) & 3)) return false;
+        t->addr = base(rn) + uint64_t((w >> 10) & 0xFFF) * t->bytes;
+        return true;
+    }
+    if ((w & 0x3B200000) == 0x38000000) {  // unscaled / post / pre index
+        if (!single((w >> 22) & 3)) return false;
+        const int64_t imm = int64_t(int32_t(w << 11) >> 23);
+        const unsigned mode = (w >> 10) & 3;
+        t->addr = base(rn) + (mode == 1 ? 0 : imm);
+        if (mode == 1 || mode == 3) {
+            t->wb_reg = rn;
+            t->wb_value = base(rn) + imm;
+        }
+        return true;
+    }
+    if ((w & 0x3B200C00) == 0x38200800) {  // register offset
+        if (!single((w >> 22) & 3)) return false;
+        const uint64_t m = reg((w >> 16) & 31);
+        const unsigned option = (w >> 13) & 7;
+        int64_t off;
+        if (option == 2) off = int64_t(uint32_t(m));
+        else if (option == 6) off = int64_t(int32_t(uint32_t(m)));
+        else if (option == 3 || option == 7) off = int64_t(m);
+        else return false;
+        if ((w >> 12) & 1) off <<= __builtin_ctz(t->bytes);
+        t->addr = base(rn) + uint64_t(off);
+        return true;
+    }
+    if ((w & 0x3A000000) == 0x28000000) {  // pair
+        const unsigned opc = w >> 30, idx = (w >> 23) & 3;
+        t->load = (w >> 22) & 1;
+        t->fp = v;
+        t->count = 2;
+        t->rt2 = (w >> 10) & 31;
+        if (v) {
+            if (opc == 3) return false;
+            t->bytes = 4u << opc;
+        } else if (opc == 0) {
+            t->bytes = 4;
+        } else if (opc == 2) {
+            t->bytes = 8;
+        } else if (opc == 1 && t->load) {
+            t->bytes = 4;
+            t->sext = 64;
+        } else {
+            return false;
+        }
+        const int64_t imm = int64_t(int32_t(w << 10) >> 25) * int64_t(t->bytes);
+        t->addr = base(rn) + (idx == 1 ? 0 : imm);
+        if (idx == 1 || idx == 3) {
+            t->wb_reg = rn;
+            t->wb_value = base(rn) + imm;
+        }
+        return true;
+    }
+    return false;
+}
+bool TrapExecute(ucontext_t* uc, const TrapAccess& t) {
+    __uint128_t* vr = t.fp ? TrapFpRegs(uc) : nullptr;
+    if (t.fp && !vr) return false;
+    auto& mc = uc->uc_mcontext;
+    for (unsigned k = 0; k < t.count; k++) {
+        const int r = k ? t.rt2 : t.rt;
+        uint8_t* p = reinterpret_cast<uint8_t*>(t.addr + k * t.bytes);
+        if (t.load) {
+            if (t.fp) {
+                __uint128_t v = 0;
+                memcpy(&v, p, t.bytes);
+                vr[r] = v;
+            } else {
+                uint64_t v = 0;
+                memcpy(&v, p, t.bytes);
+                if (t.sext && t.bytes < 8) {
+                    const int sh = 64 - 8 * int(t.bytes);
+                    v = uint64_t(int64_t(v << sh) >> sh);
+                    if (t.sext == 32) v &= 0xFFFFFFFFull;
+                }
+                if (r != 31) mc.regs[r] = v;
+            }
+        } else {
+            if (t.fp) {
+                memcpy(p, &vr[r], t.bytes);
+            } else {
+                const uint64_t v = r == 31 ? 0 : mc.regs[r];
+                memcpy(p, &v, t.bytes);
+            }
+        }
+    }
+    if (t.wb_reg >= 0) {
+        if (t.wb_reg == 31) mc.sp = t.wb_value;
+        else mc.regs[t.wb_reg] = t.wb_value;
+    }
+    mc.pc += 4;
+    return true;
+}
+
 void TrapHandler(int sig, siginfo_t* si, void* ctx) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
     if (const uintptr_t lo = g_cam_trap_lo.load(std::memory_order_relaxed);
@@ -398,19 +551,31 @@ void TrapHandler(int sig, siginfo_t* si, void* ctx) {
         g_cam_trap_faults.fetch_add(1, std::memory_order_relaxed);
         const uintptr_t at = g_cam_trap_at.load(std::memory_order_relaxed);
         auto* uc = static_cast<ucontext_t*>(ctx);
-        if (a < at || a >= at + 8 || uc->uc_mcontext.pc < g_main_base || uc->uc_mcontext.pc >= g_main_end) return;
-        g_cam_trap_hits.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t pc = (uc->uc_mcontext.pc - g_main_base) & 0x0FFFFFFF;
-        const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
-        const uint64_t key = (uint64_t(a - at) << 56) | (pc << 28) | lr;
-        const int n = g_cam_trap_count.load(std::memory_order_relaxed);
-        bool seen = false;
-        for (int i = 0; i < n && i < 32; i++) seen |= g_cam_trap_seen[i] == key;
-        if (!seen && n < 32) {
-            g_cam_trap_seen[n] = key;
-            g_cam_trap_pending[n].store(key, std::memory_order_relaxed);
-            g_cam_trap_count.store(n + 1, std::memory_order_release);
+        const bool guest = uc->uc_mcontext.pc >= g_main_base && uc->uc_mcontext.pc < g_main_end;
+        TrapAccess t;
+        bool done = false;
+        if (guest && TrapDecode(uc, *reinterpret_cast<const uint32_t*>(uc->uc_mcontext.pc), &t)) {
+            const uint64_t pc0 = uc->uc_mcontext.pc;
+            const uintptr_t end = t.addr + uintptr_t(t.bytes) * t.count;
+            if (t.addr < at + 8 && end > at) {
+                g_cam_trap_hits.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t pc = (pc0 - g_main_base) & 0x07FFFFFF;
+                const uint64_t lr = (uc->uc_mcontext.regs[30] - g_main_base) & 0x0FFFFFFF;
+                const uint64_t off = t.addr >= at ? t.addr - at : 0;
+                const uint64_t key = ((off & 0x7F) << 56) | (uint64_t(t.load) << 55) | (pc << 28) | lr;
+                const int n = g_cam_trap_count.load(std::memory_order_relaxed);
+                bool seen = false;
+                for (int i = 0; i < n && i < 32; i++) seen |= g_cam_trap_seen[i] == key;
+                if (!seen && n < 32) {
+                    g_cam_trap_seen[n] = key;
+                    g_cam_trap_pending[n].store(key, std::memory_order_relaxed);
+                    g_cam_trap_count.store(n + 1, std::memory_order_release);
+                }
+            }
+            done = TrapExecute(uc, t);
         }
+        if (done && g_cam_trap_lo.load(std::memory_order_relaxed))
+            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
         return;
     }
     for (int w = 0; w < 2; w++) {
@@ -464,15 +629,14 @@ void StartCamTrap(uintptr_t at) {
         const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         g_cam_trap_lo = lo;
         while (std::chrono::steady_clock::now() < end) {
-            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
-            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_READ | PROT_WRITE);
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            mprotect(reinterpret_cast<void*>(lo), g_trap_page_size, PROT_NONE);  // after an access not carried out
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             const int n = g_cam_trap_count.load(std::memory_order_acquire);
             for (; logged < n; logged++) {
                 const uint64_t v = g_cam_trap_pending[logged].load(std::memory_order_relaxed);
-                LOGI("hooks", "camera trap: +%d of the camera input accessed at main+0x%llx (return main+0x%llx)",
-                     64 + int(v >> 56), (unsigned long long)((v >> 28) & 0x0FFFFFFF),
+                LOGI("hooks", "camera trap: +%d of the camera input %s at main+0x%llx (return main+0x%llx)",
+                     64 + int((v >> 56) & 0x7F), (v >> 55) & 1 ? "read" : "written",
+                     (unsigned long long)((v >> 28) & 0x07FFFFFF),
                      (unsigned long long)(v & 0x0FFFFFFF));
             }
         }
