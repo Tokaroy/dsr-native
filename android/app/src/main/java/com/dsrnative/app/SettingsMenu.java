@@ -892,8 +892,8 @@ public final class SettingsMenu {
                 new String[] {"30%", "50%", "70%", "100%"}, "0.7");
         choice("touch_camera_mode", Strings.t("cammode_t"), Strings.t("cammode_n"), new String[] {"stick", "swipe"},
                 new String[] {Strings.t("cammode_stick"), Strings.t("cammode_swipe")}, "swipe");
-        choice("touch_camera_speed", Strings.t("camspeed_t"), null, new String[] {"0.75", "1.0", "1.5", "2.0"},
-                new String[] {Strings.t("speed_slow"), Strings.t("speed_normal"), Strings.t("speed_fast"),
+        choice("touch_camera_speed", Strings.t("camspeed_t"), null, new String[] {"0.5", "0.75", "1.0", "1.5", "2.0"},
+                new String[] {Strings.t("speed_vslow"), Strings.t("speed_slow"), Strings.t("speed_normal"), Strings.t("speed_fast"),
                         Strings.t("speed_faster")}, "1.0");
         toggle("touch_camera_invert", Strings.t("invert_t"), null, "1", "0", "0");
         toggle("touch_camera_recenter", Strings.t("drift_t"), Strings.t("drift_n"), "0", "1", "1");

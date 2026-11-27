@@ -685,6 +685,8 @@ final class Strings {
         put("camspeed_t", "Camera sensitivity", "Sensibilité de la caméra", "Kameraempfindlichkeit",
                 "Sensibilità della telecamera", "Sensibilidad de la cámara", "Sensibilidade da câmera",
                 "Чувствительность камеры", "カメラ感度", "카메라 감도", "视角灵敏度", "視角靈敏度");
+        put("speed_vslow", "Very slow", "Très lente", "Sehr langsam", "Molto lenta", "Muy lenta", "Muito lenta",
+                "Очень медленно", "とても遅い", "매우 느리게", "很慢", "很慢");
         put("speed_slow", "Slow", "Lente", "Langsam", "Lenta", "Lenta", "Lenta", "Медленно", "遅い", "느리게", "慢", "慢");
         put("speed_normal", "Normal", "Normale", "Normal", "Normale", "Normal", "Normal", "Обычно", "普通", "보통", "普通",
                 "普通");
