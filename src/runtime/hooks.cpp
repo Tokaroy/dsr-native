@@ -596,6 +596,9 @@ std::atomic<float> g_gpu_frame_ms{0.0f};
 std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, ms
 std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
 std::atomic<int64_t> g_refresh_last{0}, g_refresh_period{0};  // ReportDisplayRefresh
+std::atomic<uint64_t> g_lim_grid{0}, g_lim_other{0}, g_lim_slept{0}, g_lim_sleep_ns{0}, g_lim_missed{0},
+    g_lim_resync{0};
+std::atomic<int64_t> g_lim_phase_us{0}, g_lim_slack_sum_us{0}, g_lim_miss_sum_us{0};
 bool MoviePlaying() { return g_movies.load(std::memory_order_relaxed) > 0; }
 int MovieFps() { return g_build ? g_build->movie_fps : 30; }
 int MinFps() { return std::clamp(GetRuntime().config.min_fps, 15, 30); }
@@ -699,19 +702,33 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
             const int64_t spacing = std::max<int64_t>(1, std::llround(double(period.count()) / double(vp)));
             auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };
             int64_t next = grid ? on_grid(grid + spacing * vp - vp / 2) : 0;
-            if (!next || next < tn - 4 * vp) next = on_grid(tn);  // first frame, or after a stall: from now
+            if (!next || next < tn - 4 * vp) {  // first frame, or after a stall: from now
+                next = on_grid(tn);
+                g_lim_resync.fetch_add(1, std::memory_order_relaxed);
+            }
             phase_ms += std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - 1.5) * 0.15, -0.5, 0.5);
             phase_ms = std::clamp(phase_ms, -double(vp) / 1e6, double(vp) / 1e6);
             grid = next;
             deadline = clock::time_point(std::chrono::nanoseconds(next + int64_t(phase_ms * 1e6)));
+            g_lim_grid.fetch_add(1, std::memory_order_relaxed);
+            g_lim_phase_us.store(int64_t(phase_ms * 1000), std::memory_order_relaxed);
+            g_lim_slack_sum_us.fetch_add(int64_t(g_present_slack_ms.load(std::memory_order_relaxed) * 1000),
+                                         std::memory_order_relaxed);
+            if (now > deadline) {
+                g_lim_missed.fetch_add(1, std::memory_order_relaxed);
+                g_lim_miss_sum_us.fetch_add((now - deadline).count() / 1000, std::memory_order_relaxed);
+            }
         } else {
             grid = 0;
+            g_lim_other.fetch_add(1, std::memory_order_relaxed);
             deadline += period;
             // More than half a period behind (a hitch, a loading stall, a lower rate than before, the game held by
             // the menu): the schedule starts again from now instead of rushing frames out to catch up.
             if (now > deadline + period / 2) deadline = now;
         }
         if (now < deadline) {
+            g_lim_slept.fetch_add(1, std::memory_order_relaxed);
+            g_lim_sleep_ns.fetch_add(uint64_t((deadline - now).count()), std::memory_order_relaxed);
             std::this_thread::sleep_until(deadline);
             now = clock::now();
         }
@@ -858,6 +875,21 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+std::string TakeLimiterReport() {
+    const uint64_t grid = g_lim_grid.exchange(0), other = g_lim_other.exchange(0), slept = g_lim_slept.exchange(0),
+                   sleep_ns = g_lim_sleep_ns.exchange(0), missed = g_lim_missed.exchange(0),
+                   resync = g_lim_resync.exchange(0);
+    const int64_t slack = g_lim_slack_sum_us.exchange(0), miss = g_lim_miss_sum_us.exchange(0);
+    char b[256];
+    snprintf(b, sizeof(b),
+             "frame limiter: %llu frames on the refresh grid (%llu restarts), %llu not; %llu slept %.1f ms on average, "
+             "%llu came %.1f ms after their deadline on average; phase %.1f ms, slack followed %.1f ms on average",
+             (unsigned long long)grid, (unsigned long long)resync, (unsigned long long)other, (unsigned long long)slept,
+             slept ? sleep_ns / 1e6 / double(slept) : 0.0, (unsigned long long)missed,
+             missed ? miss / 1e3 / double(missed) : 0.0, g_lim_phase_us.load() / 1e3,
+             grid ? slack / 1e3 / double(grid) : 0.0);
+    return b;
+}
 void ReportDisplayRefresh(int64_t last_ns, int64_t period_ns) {
     g_refresh_period.store(period_ns, std::memory_order_relaxed);
     g_refresh_last.store(last_ns, std::memory_order_release);

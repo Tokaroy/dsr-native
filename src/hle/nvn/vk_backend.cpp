@@ -7911,6 +7911,7 @@ private:
                      "time estimate %.1f ms), %llu ran late",
                      vp ? 1e9 / double(vp) : 0.0, (unsigned long long)hf, hf ? hn / 1e6 / double(hf) : 0.0, gpu_est_ms_,
                      (unsigned long long)hl);
+                LOGI(kTag, "%s", dsr::TakeLimiterReport().c_str());
             }
             drain_ms_ = 0;
             rec_batches_ = 0;
