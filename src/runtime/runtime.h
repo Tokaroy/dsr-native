@@ -209,10 +209,9 @@ int FrameRateNow();  // the rate the frame limiter paces to now (the cap, or the
 // Smoothed GPU time of one submission in ms (0 = not known yet), from the Vulkan backend's GPU timestamps: what the
 // dynamic frame rate (fps = auto) weighs against the frame period.
 void ReportGpuFrameTime(double ms);
-// present_mode mailbox pacing (vk_backend.cpp, MailboxHold), once per frame: how long before its slot (the moment
-// its submission must start to finish half a refresh before its refresh) the frame was ready, in ms (negative:
-// late). The frame limiter moves the game's frames by it, so they are ready just before their slot instead of
-// waiting (that wait was a refresh of added latency).
+// present_mode mailbox pacing (vk_backend.cpp, MailboxHold), once per frame: how much earlier than its aim (half a
+// refresh before the nearest refresh) the frame will finish, in ms, within half a refresh (negative: later). The
+// frame limiter moves the phase of its refresh-grid deadlines by it.
 void ReportPresentSlack(double ms);
 // The display's last refresh (steady_clock / CLOCK_MONOTONIC ns) and refresh period, from the Vulkan backend's
 // AChoreographer thread (present_mode mailbox): the frame limiter then starts frames on the refresh grid.

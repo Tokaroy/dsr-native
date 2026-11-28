@@ -2030,18 +2030,18 @@ private:
     CallTime t_acquire_, t_present_, t_submit_;
     // ---- present_mode mailbox pacing (settings.txt mailbox_pacing) ----
     // Mailbox shows the newest finished frame at each refresh: low latency, but on a 60 Hz screen at 60 fps the
-    // frames finish at varying moments against the refreshes (game and GPU time vary), so now and then two finish
-    // within one refresh (the first is dropped) and the next refresh repeats a frame: a stutter. Here each frame
-    // (its whole submission, the GPU work and the copy to the screen) is held back until it will finish half a
-    // refresh before the refresh it is meant for: one frame per refresh (or per 2 at 30 fps), always at the same
-    // point between two refreshes, never queued (FIFO's queue of finished frames was its added latency). How early
-    // each frame was for its slot goes to the frame limiter (ReportPresentSlack), which starts the game's frames
-    // later until they arrive just before it: holding frames for most of a refresh added that much input latency.
+    // frames finish at varying moments against the refreshes, so when one finishes close to the moment the
+    // compositor takes a frame for a refresh, small variations put two frames in one refresh (one dropped) and none
+    // in the next (repeated): a stutter. Paced, the frame limiter starts the game's frames on the display's refresh
+    // grid with a phase such that each frame finishes in the middle between two such moments (half a refresh, or
+    // mailbox_margin, before its refresh), where a variation of up to half a refresh either way changes nothing.
+    // Nothing is held here: holding frames on this thread stalled the game behind them (it then waited at its
+    // presents, input already read: a refresh of added latency). Each frame's distance from that middle goes to the
+    // frame limiter (ReportPresentSlack), which moves its phase.
     bool mailbox_ = false;
-    int64_t mailbox_target_ = 0;  // the refresh the previous frame was meant for (steady_clock ns)
-    bool mailbox_prev_late_ = false;
+    int64_t mailbox_shown_ = 0;   // the refresh the previous frame was expected on (steady_clock ns)
     double gpu_est_ms_ = 0;       // GPU time of a frame's submission: rises at once, falls slowly
-    std::atomic<uint64_t> hold_frames_{0}, hold_ns_{0}, hold_late_{0};  // recorder thread; read by the report
+    std::atomic<uint64_t> pace_frames_{0}, pace_off_us_{0}, pace_dropped_{0}, pace_repeated_{0};  // read by the report
     static int64_t SteadyNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count();
@@ -2052,50 +2052,25 @@ private:
         if (!g_vsync.Get(&vs, &vp)) return;
         const int64_t now = SteadyNs();
         if (now - vs > 8 * vp || vs - now > vp) return;  // refresh times stale (paused) or not usable
-        const int64_t gpu = int64_t((gpu_est_ms_ + 1.0) * 1e6);
-        const int fps = std::max(1, dsr::FrameRateNow());
-        const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
-        auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };  // next refresh
-        // How long before its refresh a frame must be finished (settings.txt mailbox_margin in ms; default half a
-        // refresh): the screen compositor takes the newest finished frame a little before each refresh.
         const double margin_ms = dsr::GetRuntime().config.mailbox_margin_ms;
         const int64_t margin = margin_ms > 0 ? std::min<int64_t>(int64_t(margin_ms * 1e6), vp - 1'000'000) : vp / 2;
-        // Started now, the GPU work is done at now + gpu: the first refresh at least `margin` after that.
-        const int64_t earliest = on_grid(now + gpu + margin);
-        int64_t target = earliest;
-        if (mailbox_target_ && mailbox_target_ + 8 * vp < earliest) mailbox_target_ = 0;  // after a pause: start over
-        if (mailbox_target_) {
-            // This frame's slot: `spacing` refreshes after the previous one. Ready before it: wait for it; after it:
-            // the next possible refresh (late).
-            const int64_t slot = on_grid(mailbox_target_ + spacing * vp - margin);
-            const int64_t slack = slot - margin - gpu - now;
-            const bool late = slot < earliest;
-            // How early the frame was goes to the frame limiter, which starts the game's frames later (or earlier
-            // when late) until they arrive about 1.5 ms before their slot. Not for the frame after a late one: its
-            // slot moved a refresh on, so it reads as nearly a refresh early (a 58.5 fps spiral before).
-            // Wrapped to within half a refresh of the aim (3 ms early): the slot chain follows the frames, so how
-            // early a frame is for its slot is only defined within a refresh; the frame limiter keeps the rate on the
-            // refresh grid and moves just the phase, so a wrapped reading cannot slow the game.
-            if (late || !mailbox_prev_late_) {
-                int64_t err = slack - 3'000'000;
-                err -= ((err + vp / 2) >= 0 ? (err + vp / 2) / vp : (err + vp / 2 - vp + 1) / vp) * vp;
-                dsr::ReportPresentSlack(double(err + 3'000'000) / 1e6);
-            }
-            mailbox_prev_late_ = late;
-            if (!late) {
-                target = slot;
-            } else {
-                hold_late_++;
-            }
+        const int fps = std::max(1, dsr::FrameRateNow());
+        const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
+        // Submitted now, the frame is finished at about now + its GPU time. The aim: `margin` before the nearest
+        // refresh.
+        const int64_t done = now + int64_t(gpu_est_ms_ * 1e6);
+        const int64_t k = (done + margin - vs + (done + margin >= vs ? vp / 2 : -vp / 2)) / vp;  // nearest refresh
+        const int64_t err = done - (vs + k * vp - margin);  // > 0: later than the aim; within half a refresh
+        dsr::ReportPresentSlack(-double(err) / 1e6);
+        pace_off_us_ += uint64_t(std::llabs(err) / 1000);
+        // Which refresh shows it (the first after it is done): two on one refresh drop one, a gap repeats one.
+        const int64_t shown = vs + ((done - vs + vp - 1) / vp) * vp;
+        if (mailbox_shown_) {
+            if (shown <= mailbox_shown_) pace_dropped_++;
+            else if (shown > mailbox_shown_ + spacing * vp + vp / 2) pace_repeated_++;
         }
-        int64_t start = target - margin - gpu;
-        if (start - now > 3 * vp) start = now + 3 * vp;  // bounded, whatever the estimates say
-        if (start > now) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(start - now));
-            hold_ns_ += uint64_t(start - now);
-        }
-        hold_frames_++;
-        mailbox_target_ = target;
+        mailbox_shown_ = shown;
+        pace_frames_++;
     }
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
@@ -7912,11 +7887,12 @@ private:
             if (mailbox_) {
                 int64_t vs = 0, vp = 0;
                 g_vsync.Get(&vs, &vp);
-                const uint64_t hf = hold_frames_.exchange(0), hn = hold_ns_.exchange(0), hl = hold_late_.exchange(0);
-                LOGI(kTag, "mailbox pacing (last 10 s): screen at %.1f Hz, %llu frames held %.1f ms on average (GPU "
-                     "time estimate %.1f ms), %llu ran late",
-                     vp ? 1e9 / double(vp) : 0.0, (unsigned long long)hf, hf ? hn / 1e6 / double(hf) : 0.0, gpu_est_ms_,
-                     (unsigned long long)hl);
+                const uint64_t pf = pace_frames_.exchange(0), po = pace_off_us_.exchange(0),
+                               pd = pace_dropped_.exchange(0), pr = pace_repeated_.exchange(0);
+                LOGI(kTag, "mailbox pacing (last 10 s): screen at %.1f Hz, %llu frames finishing %.1f ms from the aim on "
+                     "average (GPU time estimate %.1f ms); expected: %llu dropped, %llu repeated",
+                     vp ? 1e9 / double(vp) : 0.0, (unsigned long long)pf, pf ? po / 1e3 / double(pf) : 0.0, gpu_est_ms_,
+                     (unsigned long long)pd, (unsigned long long)pr);
                 LOGI(kTag, "%s", dsr::TakeLimiterReport().c_str());
             }
             drain_ms_ = 0;
