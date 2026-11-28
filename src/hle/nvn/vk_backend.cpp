@@ -2041,7 +2041,8 @@ private:
     bool mailbox_ = false;
     int64_t mailbox_shown_ = 0;   // the refresh the previous frame was expected on (steady_clock ns)
     double gpu_est_ms_ = 0;       // GPU time of a frame's submission: rises at once, falls slowly
-    std::atomic<uint64_t> pace_frames_{0}, pace_off_us_{0}, pace_dropped_{0}, pace_repeated_{0};  // read by the report
+    std::atomic<uint64_t> pace_frames_{0}, pace_off_us_{0}, pace_dropped_{0}, pace_repeated_{0}, pace_held_{0},
+        pace_hold_us_{0};  // read by the report
     static int64_t SteadyNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count();
@@ -2055,6 +2056,7 @@ private:
         const double margin_ms = dsr::GetRuntime().config.mailbox_margin_ms;
         const int64_t margin = margin_ms > 0 ? std::min<int64_t>(int64_t(margin_ms * 1e6), vp - 1'000'000) : vp / 2;
         const int fps = std::max(1, dsr::FrameRateNow());
+        constexpr int64_t kMaxHold = 3'000'000;  // early frames held back to their aim, at most this
         const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
         // Submitted now, the frame is finished at about now + its GPU time. The aim: `margin` before the nearest
         // refresh.
@@ -2082,6 +2084,15 @@ private:
         }
         mailbox_shown_ = shown;
         pace_frames_++;
+        // Early: held back to its aim, at most 3 ms (frames can then aim 1.5 ms early on average, the frame limiter
+        // keeping them there, and a late one has that much more room before it misses its refresh). Longer holds
+        // stalled the game behind them before.
+        if (err < 0) {
+            const int64_t hold = std::min(-err, kMaxHold);
+            std::this_thread::sleep_for(std::chrono::nanoseconds(hold));
+            pace_held_++;
+            pace_hold_us_ += uint64_t(hold / 1000);
+        }
     }
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
@@ -7899,11 +7910,14 @@ private:
                 int64_t vs = 0, vp = 0;
                 g_vsync.Get(&vs, &vp);
                 const uint64_t pf = pace_frames_.exchange(0), po = pace_off_us_.exchange(0),
-                               pd = pace_dropped_.exchange(0), pr = pace_repeated_.exchange(0);
+                               pd = pace_dropped_.exchange(0), pr = pace_repeated_.exchange(0),
+                               ph = pace_held_.exchange(0), phu = pace_hold_us_.exchange(0);
                 LOGI(kTag, "mailbox pacing (last 10 s): screen at %.1f Hz, %llu frames finishing %.1f ms from the aim on "
-                     "average (GPU time estimate %.1f ms); expected: %llu dropped, %llu repeated",
+                     "average (GPU time estimate %.1f ms), %llu early ones held %.1f ms on average; expected: %llu dropped, %llu "
+                     "repeated",
                      vp ? 1e9 / double(vp) : 0.0, (unsigned long long)pf, pf ? po / 1e3 / double(pf) : 0.0, gpu_est_ms_,
-                     (unsigned long long)pd, (unsigned long long)pr);
+                     (unsigned long long)ph, ph ? phu / 1e3 / double(ph) : 0.0, (unsigned long long)pd,
+                     (unsigned long long)pr);
                 LOGI(kTag, "%s", dsr::TakeLimiterReport().c_str());
             }
             drain_ms_ = 0;

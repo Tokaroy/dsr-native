@@ -595,8 +595,9 @@ std::atomic<int> g_movies{0};
 std::atomic<int> g_cap_fps{60};  // the rate the limiter paces to with fps = auto
 std::atomic<float> g_gpu_frame_ms{0.0f};
 std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, ms
-// Where a paced frame aims to finish against its aim point (ms; ReportPresentSlack: positive = earlier).
-constexpr double kPacingSlackMs = 0.0;
+// Where a paced frame aims to finish against its aim point (ms; ReportPresentSlack: positive = earlier): 1.5 ms
+// early on average; early ones are held back to the aim (at most 3 ms, MailboxHold), late ones get the room.
+constexpr double kPacingSlackMs = 1.5;
 std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
 std::atomic<int64_t> g_refresh_last{0}, g_refresh_period{0};  // ReportDisplayRefresh
 std::atomic<uint64_t> g_lim_grid{0}, g_lim_other{0}, g_lim_slept{0}, g_lim_sleep_ns{0}, g_lim_missed{0},
