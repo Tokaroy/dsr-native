@@ -5,6 +5,7 @@ The profiler reports dsr+0x... offsets rounded down to 64 bytes. For every such 
 named on the command line (substring match on the demangled name), prints the source lines its instructions
 come from, innermost inlined function first: `bucket: func file:line; ...`.
 """
+import json
 import subprocess
 import sys
 
@@ -21,27 +22,19 @@ for start, size, name in sorted(funcs):
     print(f"## {start:x} {name[:160]}")
     first = start & ~63
     addrs = list(range(start, start + size, 4))
-    out = subprocess.run([symbolizer, "--obj=" + lib, "-f", "-i", "-C", "--output-style=GNU", "--relative-address"],
+    out = subprocess.run([symbolizer, "--obj=" + lib, "-f", "-i", "-C", "--output-style=JSON"],
                          input="\n".join(hex(a) for a in addrs), capture_output=True, text=True).stdout
-    blocks = out.split("\n")
-    # llvm-symbolizer prints one (function, location) pair per inline frame, a blank line between addresses.
-    per_addr, cur = [], []
-    for l in blocks:
-        if l == "":
-            if cur:
-                per_addr.append(cur)
-            cur = []
-        else:
-            cur.append(l)
-    if cur:
-        per_addr.append(cur)
     buckets = {}
-    for a, frames in zip(addrs, per_addr):
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        r = json.loads(line)
+        a = int(r.get("Address", "0"), 16)
         pairs = []
-        for i in range(0, len(frames) - 1, 2):
-            fn = frames[i].split("(")[0].split("::")[-1][:40]
-            loc = frames[i + 1].rsplit("/", 1)[-1]
-            pairs.append(f"{fn} {loc}")
+        for f in r.get("Symbol", []):
+            fn = f.get("FunctionName", "").replace("(anonymous namespace)::", "").split("(")[0].split("::")[-1][:40]
+            pairs.append(f"{fn} {f.get('FileName', '').rsplit('/', 1)[-1]}:{f.get('Line', 0)}")
         key = " < ".join(pairs[:3])
         b = buckets.setdefault(a & ~63, [])
         if key not in b:
