@@ -671,15 +671,28 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
         return;
     using clock = std::chrono::steady_clock;
     static clock::time_point last;
+    // The frame deadlines: one period after the previous deadline, not after the moment the previous sleep ended.
+    // Measured from the wake-up, every frame came out a little late (the sleep overshoots by up to a few tenths of
+    // a ms), 16.8 ms instead of 16.67 at 60 fps: on a 120 Hz screen the frames slid against the refreshes and every
+    // second or so one was shown a refresh late, or (present_mode mailbox) dropped for the next: a stutter.
+    static clock::time_point deadline;
     auto now = clock::now();
     // fps = auto: what this frame cost before any sleeping (videos are paced at their own rate).
     if (rt.config.dynamic_fps && last.time_since_epoch().count() != 0 && !MoviePlaying())
         DynamicStep(std::chrono::duration<double, std::milli>(now - last).count());
     const int fps = FrameRateNow();
     const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
-    if (last.time_since_epoch().count() != 0 && now < last + period) {
-        std::this_thread::sleep_until(last + period);
-        now = clock::now();
+    if (last.time_since_epoch().count() != 0) {
+        deadline += period;
+        // More than half a period behind (a hitch, a loading stall, a lower rate than before, the game held by the
+        // menu): the schedule starts again from now instead of rushing frames out to catch up.
+        if (now > deadline + period / 2) deadline = now;
+        if (now < deadline) {
+            std::this_thread::sleep_until(deadline);
+            now = clock::now();
+        }
+    } else {
+        deadline = now;
     }
     const double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / fps;
     last = now;
