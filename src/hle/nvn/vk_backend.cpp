@@ -842,7 +842,9 @@ public:
                 case CmdType::BindVertexStreams:
                     {
                         const auto v = Items<VertexStreamObj>(c);
-                        st_.streams.assign(v.begin(), v.end());
+                        if (st_.streams.size() != v.size() ||
+                            (v.size() && memcmp(st_.streams.data(), v.data(), v.size() * sizeof(VertexStreamObj))))
+                            st_.streams.assign(v.begin(), v.end());
                     }
                     break;
                 case CmdType::BindVertexBuffers: {
@@ -1890,6 +1892,7 @@ private:
         instance_ = VK_NULL_HANDLE;
         // CPU-side caches: their memory back (this object is kept, with its stopped threads, but holds little).
         images_ = {};
+        ImageCacheClear();
         parked_ = {};
         sharp_imgs_ = {};
         retired_ = {};
@@ -2879,10 +2882,28 @@ private:
     // ======================================================================================================
     // images
     // ======================================================================================================
+    // FindImage is ~4% of the render thread (unordered_map lookups, a division each): a small direct-mapped cache
+    // of address -> Image*, emptied whenever an image leaves the map (node pointers stay valid otherwise).
+    struct ImageCacheEntry {
+        uint64_t addr = 0;
+        Image* img = nullptr;
+    };
+    ImageCacheEntry image_cache_[256];
+    void ImageCacheClear() {
+        for (ImageCacheEntry& e : image_cache_) e = {};
+    }
     Image* FindImage(const TexRef& t) {
-        auto it = images_.find(t.addr);
-        if (it == images_.end()) return nullptr;
-        Image& img = it->second;
+        ImageCacheEntry& ce = image_cache_[(t.addr >> 8 ^ t.addr >> 20) & 255];
+        Image* found;
+        if (ce.addr == t.addr && ce.img) {
+            found = ce.img;
+        } else {
+            auto it = images_.find(t.addr);
+            if (it == images_.end()) return nullptr;
+            found = &it->second;
+            ce = {t.addr, found};
+        }
+        Image& img = *found;
         const int ow = img.mip_skip ? img.tex.width : img.width, oh = img.mip_skip ? img.tex.height : img.height;
         if (img.nvn_format != t.tex.format || ow != t.tex.width || oh != t.tex.height) {
             const uint64_t key = t.addr ^ (uint64_t(t.tex.format) << 48) ^ (uint64_t(img.nvn_format) << 56);
@@ -3292,7 +3313,7 @@ private:
             } else {
                 DestroyImage(cur->second);
             }
-            images_.erase(cur);
+            images_.erase(cur); ImageCacheClear();
             if (it == parked_.end()) return nullptr;  // made room for the one just parked
         }
         Image img = std::move(it->second.img);
@@ -3315,7 +3336,7 @@ private:
         if (old != images_.end()) {
             if (park_drawn && old->second.written && old->second.image) Park(old->second);
             else DestroyImage(old->second);  // retired: destroyed once the GPU is done with it
-            images_.erase(old);
+            images_.erase(old); ImageCacheClear();
         }
         const TextureLayout layout = ComputeLayout(t.tex);
         Image img;
@@ -7985,9 +8006,10 @@ private:
         }
         std::string skipped;
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
-        LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes, %llu split submissions%s",
+        LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes, %llu split submissions (last 10 s)%s",
              (unsigned long long)drawn_, pipelines_.size(), shaders_translated_, uploads_, flushes_,
              (unsigned long long)splits_, skipped.c_str());
+        splits_ = 0;
         if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
                  (unsigned long long)bc_converted_levels_, bc_convert_ms_, (unsigned long long)bc_cache_hits_,

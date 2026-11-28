@@ -59,6 +59,9 @@ FormatInfo GetFormatInfo(int f) {
     return {1, 1, 8};                           // unknown: generous
 }
 
+// Bumped on every change of the registered pools (GuestRangeValid's per-thread caches; backend.h).
+std::atomic<uint64_t> g_pool_ranges_version{1};
+
 namespace {
 constexpr const char* kTag = "nvn.null";
 
@@ -215,7 +218,6 @@ void PoolBuilderSetStorage(void* b, void* mem, size_t size) {
 }
 std::mutex g_pool_range_mutex;
 std::map<uintptr_t, size_t> g_pool_ranges;  // storage base -> size
-std::atomic<uint64_t> g_pool_ranges_version{1};  // bumped on every change (GuestRangeValid's per-thread cache)
 
 bool PoolInitialize(void* pool, const void* b) {
     MemoryPoolState s = g_pool_builders.Copy(b);
@@ -742,15 +744,15 @@ void CheckWatchedTextures() {
     }
 }
 
-bool GuestRangeValid(uint64_t addr, size_t size) {
+bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
     // Called many times per draw (~5% of the render thread with a 4-entry cache and a lock on misses): each
     // thread keeps a copy of the sorted pool list, refreshed only when pools change, and searches it lock-free.
+    // The inline fast path (backend.h) answers repeats inside the pool found last without a call; this fills it.
     struct Range {
         uintptr_t lo, hi;
     };
     thread_local uint64_t cached_version = 0;
     thread_local std::vector<Range> ranges;
-    thread_local size_t last = 0;
     if (addr + size < addr) return false;
     const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
     if (version != cached_version) {
@@ -758,10 +760,8 @@ bool GuestRangeValid(uint64_t addr, size_t size) {
         ranges.clear();
         for (const auto& [base, sz] : g_pool_ranges) ranges.push_back({base, base + sz});
         cached_version = g_pool_ranges_version.load(std::memory_order_relaxed);
-        last = 0;
     }
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
-    if (last < ranges.size() && lo >= ranges[last].lo && hi <= ranges[last].hi) return true;
     // The last pool starting at or below addr.
     size_t l = 0, r = ranges.size();
     while (l < r) {
@@ -772,7 +772,9 @@ bool GuestRangeValid(uint64_t addr, size_t size) {
     if (l == 0) return false;
     const Range& p = ranges[l - 1];
     if (hi > p.hi) return false;
-    last = l - 1;
+    cache->lo = p.lo;
+    cache->hi = p.hi;
+    cache->version = cached_version;
     return true;
 }
 

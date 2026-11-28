@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // The NVN front end (null_driver.cpp + commands.cpp) records what the game asks for into host command
 // lists; a Backend executes them. On Android the backend is Vulkan (vk_backend.cpp); elsewhere it is a
 // null backend that only counts, so the recorder can be unit-tested on any host.
@@ -183,8 +184,23 @@ Backend* CreatePlatformBackend();       // Vulkan on Android, null elsewhere
 // Lookups provided by null_driver.cpp.
 TexRef MakeTexRef(const void* nvn_texture);
 TexRef WindowTexture(const void* nvn_window, int index);
-// True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read).
-bool GuestRangeValid(uint64_t addr, size_t size);
+// True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read). Called many times per draw
+// (8% of the render thread as a call): inline, a repeat inside the pool found last on this thread is answered
+// without a call; the rest goes to GuestRangeValidSlow (null_driver.cpp), which refills that cache.
+extern std::atomic<uint64_t> g_pool_ranges_version;
+struct GuestRangeCache {
+    uintptr_t lo = 1, hi = 0;
+    uint64_t version = 0;
+};
+bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
+inline bool GuestRangeValid(uint64_t addr, size_t size) {
+    static thread_local GuestRangeCache cache;
+    const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
+    if (lo >= cache.lo && hi <= cache.hi && hi >= lo &&
+        cache.version == g_pool_ranges_version.load(std::memory_order_acquire))
+        return true;
+    return GuestRangeValidSlow(addr, size, &cache);
+}
 // Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:
 // `addr` is the texture's storage address or an NVNtexture object pointer. False if no such RGBA8 texture.
 bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h);
