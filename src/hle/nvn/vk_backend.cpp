@@ -4327,15 +4327,16 @@ private:
     double gpu_partial_ms_ = 0;  // GPU time of a list's earlier parts, not yet counted
     // ---- split submissions (settings.txt split_submit) ----
     // A list used to reach the GPU as one submission at its end: the GPU started a frame only once the render thread
-    // and the recorder had gone through all of it (~10 ms on a Thor), then drew it (~12 ms). Now, where a render
-    // pass ends anyway (no extra tile store / load) and at least kSplitDraws draws have been recorded since the last
-    // submission, what is recorded goes to the GPU and recording goes on in the next slot: the GPU draws the first
+    // and the recorder had gone through all of it (~10 ms on a Thor), then drew it (~12 ms). Now, at a draw on other
+    // render targets than the one before (its pass would end anyway: no extra tile store / load; before the draw puts
+    // anything in the stream) when at least kSplitDraws draws have been recorded since the last submission, what is recorded goes to the GPU and recording goes on in the next slot: the GPU draws the first
     // passes while the rest is still being translated (less latency, steadier finish times). Not when the next
     // slot's previous work has not finished (that wait would stall the render thread), not in profiled or captured
     // frames, at most kMaxSplits per list.
     static constexpr uint64_t kSplitDraws = 300;
     static constexpr int kMaxSplits = 2;
     uint64_t split_from_draw_ = 0;
+    uint64_t last_rt_sig_ = 0;  // the previous draw's render targets (Draw)
     int splits_in_list_ = 0;
     uint64_t splits_ = 0;
     void MaybeSplitSubmit() {
@@ -4349,6 +4350,7 @@ private:
         split_from_draw_ = drawn_;
         splits_in_list_++;
         splits_++;
+        EndRendering();  // what this draw's EnsureRendering would do (its targets differ)
         slots_[slot_].partial = true;
         SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
         CollectOcclusion(slots_[slot_]);  // as Flush: the new slot's earlier queries (done on the GPU)
@@ -5288,7 +5290,6 @@ private:
         if (!rendering_ && key == ended_key_ && ended_line_) resumed_passes_[ended_line_]++;
         EndRendering();
         ended_line_ = 0;
-        MaybeSplitSubmit();
         // Work done between passes (and the copies / clears recorded since the last pass started) is its own
         // interval when there is any, not part of the previous pass's time.
         if (!late_depth_q_.empty() || !early_clears_.empty()) ProfStamp("between passes");
@@ -5816,6 +5817,19 @@ private:
         if (!begin_rendering_ && !rp_fallback_) return Skip("no dynamic rendering");
         if (!st_.program[0]) return Skip("no vertex program bound");
         const DeviceModes modes = GetDeviceModes();
+        // split_submit: a draw on other targets than the previous one starts a new pass (EnsureRendering ends the
+        // open one): the split is made here, before this draw puts its data into the stream (it must be in the
+        // slot the draw is submitted with).
+        {
+            uint64_t sig = uint64_t(st_.num_rt) + 1;
+            for (const TexRef& t : st_.rts)
+                sig = (sig ^ t.addr ^ (uint64_t(uint32_t(t.level)) << 48) ^ (uint64_t(uint32_t(t.layer)) << 56)) *
+                      0x100000001B3ull;
+            if (sig != last_rt_sig_) {
+                last_rt_sig_ = sig;
+                if (rendering_) MaybeSplitSubmit();
+            }
+        }
 
         // ---- vertex layout and shader options --------------------------------------------------------------
         shader::TranslateOptions vopt, fopt;
