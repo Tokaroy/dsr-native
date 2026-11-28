@@ -188,27 +188,30 @@ TexRef WindowTexture(const void* nvn_window, int index);
 // (8% of the render thread as a call): inline, a repeat inside the pool found last on this thread is answered
 // without a call; the rest goes to GuestRangeValidSlow (null_driver.cpp), which refills that cache.
 extern std::atomic<uint64_t> g_pool_ranges_version;
-// The pools found on this thread, by address: a direct-mapped table keyed by the address's 16 KB block (the
-// game registers ~5,000-6,000 separate pools, not adjacent to one another; an 8-entry list missed ~2.5 million
-// times per 10 s). An entry holds the whole pool, so any range inside it hits.
+// The pools found on this thread, by address: a direct-mapped table keyed by the address's 64 KB block (the
+// game registers ~6,000 separate pools, not adjacent to one another, and a frame reads tens of MB of vertex data
+// spread over them: an 8-entry list, then a 512-entry table of 16 KB blocks, missed 1.5-2.5 million times per
+// 10 s). An entry holds the whole pool, so any range inside it hits. Allocated on a thread's first check (64 KB).
 struct GuestRangeCache {
-    static constexpr int kEntries = 512;
-    static constexpr unsigned kShift = 14;
-    static unsigned Slot(uintptr_t a) { return unsigned((a >> kShift) ^ (a >> (kShift + 9))) & (kEntries - 1); }
+    static constexpr int kEntries = 4096;
+    static constexpr unsigned kShift = 16;
+    static unsigned Slot(uintptr_t a) { return unsigned((a >> kShift) ^ (a >> (kShift + 12))) & (kEntries - 1); }
     uintptr_t lo[kEntries] = {}, hi[kEntries] = {};
     uint64_t version = 0;
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
 // Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered.
 void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks);
+GuestRangeCache* NewGuestRangeCache();
 inline bool GuestRangeValid(uint64_t addr, size_t size) {
-    static thread_local GuestRangeCache cache;
+    static thread_local GuestRangeCache* cache = nullptr;
+    if (__builtin_expect(!cache, 0)) cache = NewGuestRangeCache();
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
-    if (hi >= lo && cache.version == g_pool_ranges_version.load(std::memory_order_acquire)) {
+    if (hi >= lo && cache->version == g_pool_ranges_version.load(std::memory_order_acquire)) {
         const unsigned i = GuestRangeCache::Slot(lo);
-        if (lo >= cache.lo[i] && hi <= cache.hi[i]) return true;
+        if (lo >= cache->lo[i] && hi <= cache->hi[i]) return true;
     }
-    return GuestRangeValidSlow(addr, size, &cache);
+    return GuestRangeValidSlow(addr, size, cache);
 }
 // Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:
 // `addr` is the texture's storage address or an NVNtexture object pointer. False if no such RGBA8 texture.

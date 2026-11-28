@@ -753,6 +753,9 @@ void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
     *pools = g_pool_ranges.size();
 }
+// One per thread that checks game memory, kept for the thread's life (a few threads: 64 KB each).
+GuestRangeCache* NewGuestRangeCache() { return new GuestRangeCache(); }
+
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
     g_range_slow.fetch_add(1, std::memory_order_relaxed);
     // Called many times per draw (~5% of the render thread with a 4-entry cache and a lock on misses): each
