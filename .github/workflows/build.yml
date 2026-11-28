@@ -66,6 +66,15 @@ jobs:
             "VulkanBackend::GeoHash" "VulkanBackend::IndexRange" "VulkanBackend::UploadCached" \
             "VulkanBackend::SampledView" "VulkanBackend::View(" "VulkanBackend::FindImage" "GuestRangeValidSlow"
           echo "DSR-LINES-END"
+          # Machine code of the command loop (hot spots that the source lines do not explain).
+          OBJDUMP=$BIN/llvm-objdump
+          R=$($BIN/llvm-nm -C -S --defined-only "$LIB" | grep ' VulkanBackend::ExecuteCommands(' | head -1)
+          if [ -n "$R" ]; then
+            S=$((16#$(echo $R | cut -d' ' -f1))); N=$((16#$(echo $R | cut -d' ' -f2)))
+            echo "DSR-DISASM-BEGIN"
+            $OBJDUMP -d --no-show-raw-insn -C --start-address=$S --stop-address=$((S+N)) "$LIB" | grep -v '^$' | sed 's/^ *//'
+            echo "DSR-DISASM-END"
+          fi
 
       # Unstripped native library: symbolizes the profiler's dsr+0x... addresses.
       - uses: actions/upload-artifact@v4
