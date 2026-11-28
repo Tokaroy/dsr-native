@@ -594,6 +594,9 @@ std::atomic<int> g_movies{0};
 std::atomic<int> g_cap_fps{60};  // the rate the limiter paces to with fps = auto
 std::atomic<float> g_gpu_frame_ms{0.0f};
 std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, ms
+// How early for its slot a paced frame aims to be (ms): what the game thread may run late without the frame
+// slipping a refresh, against input read that much earlier.
+constexpr double kPacingSlackMs = 3.0;
 std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
 std::atomic<int64_t> g_refresh_last{0}, g_refresh_period{0};  // ReportDisplayRefresh
 std::atomic<uint64_t> g_lim_grid{0}, g_lim_other{0}, g_lim_slept{0}, g_lim_sleep_ns{0}, g_lim_missed{0},
@@ -706,8 +709,18 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
                 next = on_grid(tn);
                 g_lim_resync.fetch_add(1, std::memory_order_relaxed);
             }
-            phase_ms += std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - 1.5) * 0.15, -0.5, 0.5);
-            phase_ms = std::clamp(phase_ms, -double(vp) / 1e6, double(vp) / 1e6);
+            phase_ms += std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - kPacingSlackMs) * 0.15, -0.5, 0.5);
+            // The phase stays within one refresh: a refresh more of it is the next refresh with none (the slot chain
+            // follows the frames, so a frame a refresh later is just as early for its slot). Wrapped with the grid
+            // moved the other way, the deadline does not jump.
+            const double vp_ms = double(vp) / 1e6;
+            if (phase_ms >= vp_ms) {
+                phase_ms -= vp_ms;
+                next += vp;
+            } else if (phase_ms < 0) {
+                phase_ms += vp_ms;
+                next -= vp;
+            }
             grid = next;
             deadline = clock::time_point(std::chrono::nanoseconds(next + int64_t(phase_ms * 1e6)));
             g_lim_grid.fetch_add(1, std::memory_order_relaxed);

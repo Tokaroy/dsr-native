@@ -2073,8 +2073,14 @@ private:
             // How early the frame was goes to the frame limiter, which starts the game's frames later (or earlier
             // when late) until they arrive about 1.5 ms before their slot. Not for the frame after a late one: its
             // slot moved a refresh on, so it reads as nearly a refresh early (a 58.5 fps spiral before).
-            if (late || !mailbox_prev_late_)
-                dsr::ReportPresentSlack(std::clamp(double(slack) / 1e6, -double(vp) / 1e6, double(vp) / 1e6));
+            // Wrapped to within half a refresh of the aim (3 ms early): the slot chain follows the frames, so how
+            // early a frame is for its slot is only defined within a refresh; the frame limiter keeps the rate on the
+            // refresh grid and moves just the phase, so a wrapped reading cannot slow the game.
+            if (late || !mailbox_prev_late_) {
+                int64_t err = slack - 3'000'000;
+                err -= ((err + vp / 2) >= 0 ? (err + vp / 2) / vp : (err + vp / 2 - vp + 1) / vp) * vp;
+                dsr::ReportPresentSlack(double(err + 3'000'000) / 1e6);
+            }
             mailbox_prev_late_ = late;
             if (!late) {
                 target = slot;
