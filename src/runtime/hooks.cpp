@@ -593,6 +593,8 @@ void SkipIntroLogos(Runtime& rt, const GameBuild& b) {
 std::atomic<int> g_movies{0};
 std::atomic<int> g_cap_fps{60};  // the rate the limiter paces to with fps = auto
 std::atomic<float> g_gpu_frame_ms{0.0f};
+std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, ms
+std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
 bool MoviePlaying() { return g_movies.load(std::memory_order_relaxed) > 0; }
 int MovieFps() { return g_build ? g_build->movie_fps : 30; }
 int MinFps() { return std::clamp(GetRuntime().config.min_fps, 15, 30); }
@@ -834,8 +836,6 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
-std::atomic<float> g_present_slack_ms{0.0f};
-std::atomic<int64_t> g_present_slack_at{0};  // steady_clock ns of the last report
 void ReportPresentSlack(double ms) {
     const float prev = g_present_slack_ms.load(std::memory_order_relaxed);
     const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
