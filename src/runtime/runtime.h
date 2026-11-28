@@ -44,6 +44,9 @@ struct RuntimeConfig {
     bool late_depth = false;
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
+    // mailbox_pacing: with present_mode mailbox, each frame is held back to finish half a refresh before the refresh
+    // it is meant for (vk_backend.cpp, MailboxHold): no dropped or repeated frames, still no queue. 0 = plain mailbox.
+    bool mailbox_pacing = true;
     std::string present_mode = "fifo";  // swapchain present mode: fifo (vsync, default), mailbox, fifo_relaxed, immediate (FIFO if unsupported)
     bool lrz_workaround = false;
     bool shader_depth_test = true;  // depth tests against gl_FragDepth-written depth done in the shader (square holes)  // refresh depth buffers written by gl_FragDepth before reuse (square holes)

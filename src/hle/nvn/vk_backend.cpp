@@ -16,6 +16,9 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #define VK_NO_PROTOTYPES
 #include <android/native_window.h>
+#include <android/choreographer.h>
+#include <android/looper.h>
+#include <pthread.h>
 #include <vulkan/vulkan.h>
 #include <adrenotools/bcenabler.h>
 #include <adrenotools/driver.h>
@@ -645,6 +648,48 @@ struct DrawState {
     std::vector<TexRef> rts;  // colors then depth at [num_rt]
     int num_rt = 0;
 };
+
+// The display's refresh times (AChoreographer on a thread of its own, started for present_mode mailbox): the last
+// refresh's time (CLOCK_MONOTONIC, as steady_clock) and the refresh period, for VulkanBackend::MailboxHold.
+class VsyncClock {
+public:
+    void Start() {
+        if (started_.exchange(true)) return;
+        std::thread([this] { Run(); }).detach();
+    }
+    bool Get(int64_t* last, int64_t* period) const {
+        *last = last_.load(std::memory_order_acquire);
+        *period = period_.load(std::memory_order_acquire);
+        return *last != 0 && *period != 0;
+    }
+
+private:
+    static void Callback(int64_t frame_ns, void* self) { static_cast<VsyncClock*>(self)->Tick(frame_ns); }
+    void Tick(int64_t t) {
+        const int64_t prev = last_.load(std::memory_order_relaxed);
+        if (prev && t > prev) {
+            int64_t d = t - prev;
+            const int64_t p = period_.load(std::memory_order_relaxed);
+            if (p && d > p + p / 2) d /= (d + p / 2) / p;  // callbacks missed: per refresh
+            if (d > 2'000'000 && d < 50'000'000)  // 20..500 Hz
+                period_.store(p ? p + (d - p) / 8 : d, std::memory_order_release);
+        }
+        last_.store(t, std::memory_order_release);
+        AChoreographer_postFrameCallback64(choreographer_, &Callback, this);
+    }
+    void Run() {
+        pthread_setname_np(pthread_self(), "dsr-vsync");
+        ALooper_prepare(0);
+        choreographer_ = AChoreographer_getInstance();
+        if (!choreographer_) return;
+        AChoreographer_postFrameCallback64(choreographer_, &Callback, this);
+        for (;;) ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
+    }
+    std::atomic<bool> started_{false};
+    std::atomic<int64_t> last_{0}, period_{0};
+    AChoreographer* choreographer_ = nullptr;
+};
+VsyncClock g_vsync;
 
 class VulkanBackend final : public Backend {
 public:
@@ -1982,6 +2027,45 @@ private:
         }
     };
     CallTime t_acquire_, t_present_, t_submit_;
+    // ---- present_mode mailbox pacing (settings.txt mailbox_pacing) ----
+    // Mailbox shows the newest finished frame at each refresh: low latency, but on a 60 Hz screen at 60 fps the
+    // frames finish at varying moments against the refreshes (game and GPU time vary), so now and then two finish
+    // within one refresh (the first is dropped) and the next refresh repeats a frame: a stutter. Here each frame
+    // (its whole submission, the GPU work and the copy to the screen) is held back until it will finish half a
+    // refresh before the refresh it is meant for: one frame per refresh (or per 2 at 30 fps), always at the same
+    // point between two refreshes, never queued (FIFO's queue of finished frames was its added latency).
+    bool mailbox_ = false;
+    int64_t mailbox_target_ = 0;  // the refresh the previous frame was meant for (steady_clock ns)
+    double gpu_est_ms_ = 0;       // GPU time of a frame's submission: rises at once, falls slowly
+    std::atomic<uint64_t> hold_frames_{0}, hold_ns_{0}, hold_late_{0};  // recorder thread; read by the report
+    static int64_t SteadyNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    void MailboxHold() {
+        if (!mailbox_) return;
+        int64_t vs, vp;
+        if (!g_vsync.Get(&vs, &vp)) return;
+        const int64_t now = SteadyNs();
+        if (now - vs > 8 * vp || vs - now > vp) return;  // refresh times stale (paused) or not usable
+        const int64_t gpu = int64_t((gpu_est_ms_ + 1.0) * 1e6);
+        const int fps = std::max(1, dsr::FrameRateNow());
+        const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
+        auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };  // next refresh
+        // Started now, the GPU work is done at now + gpu: the first refresh at least half a period after that.
+        int64_t target = on_grid(now + gpu + vp / 2);
+        if (mailbox_target_ && target < mailbox_target_ + spacing * vp - vp / 2)
+            target = on_grid(mailbox_target_ + spacing * vp - vp / 2);
+        if (mailbox_target_ && now + gpu > mailbox_target_ - vp / 4) hold_late_++;  // the previous one ran late
+        int64_t start = target - vp / 2 - gpu;
+        if (start - now > 3 * vp) start = now + 3 * vp;  // bounded, whatever the estimates say
+        if (start > now) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(start - now));
+            hold_ns_ += uint64_t(start - now);
+        }
+        hold_frames_++;
+        mailbox_target_ = target;
+    }
     void PresentSlot(int i, const PresentJob& pj) {
         uint32_t idx = 0;
         const auto ta = std::chrono::steady_clock::now();
@@ -2042,6 +2126,7 @@ private:
         const bool check = pj.src && PresentCheckRecord(sc, pj);
         CmdImageBarrier(cmd_, sc, check ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        MailboxHold();
         SubmitSlot(i, acquire_sem_, render_sem_);
         if (check) PresentCheckRead();
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -2745,6 +2830,8 @@ private:
         }
         swapchain_ = sc;
         swapchain_dirty_ = false;
+        mailbox_ = ci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR && dsr::GetRuntime().config.mailbox_pacing;
+        if (mailbox_) g_vsync.Start();
         sc_extent_ = extent;
         uint32_t ni = 0;
         vkGetSwapchainImagesKHR(device_, swapchain_, &ni, nullptr);
@@ -4211,6 +4298,7 @@ private:
         if (vkGetQueryPoolResults(device_, sl.ts, 0, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
             const double ms = double(t[1] - t[0]) * props_.limits.timestampPeriod / 1e6;
             gpu_busy_ms_ += ms;
+            gpu_est_ms_ += (ms > gpu_est_ms_ ? 0.5 : 0.05) * (ms - gpu_est_ms_);
             dsr::ReportGpuFrameTime(ms);  // fps = auto weighs it against the frame period
         }
     }
@@ -7790,6 +7878,15 @@ private:
                  (unsigned long long)desc_pools_added_, (unsigned long long)skipped_desc_);
             LOGI(kTag, "recorder in the driver (last 10 s): image acquire %s; present %s; submit %s",
                  t_acquire_.Take().c_str(), t_present_.Take().c_str(), t_submit_.Take().c_str());
+            if (mailbox_) {
+                int64_t vs = 0, vp = 0;
+                g_vsync.Get(&vs, &vp);
+                const uint64_t hf = hold_frames_.exchange(0), hn = hold_ns_.exchange(0), hl = hold_late_.exchange(0);
+                LOGI(kTag, "mailbox pacing (last 10 s): screen at %.1f Hz, %llu frames held %.1f ms on average (GPU "
+                     "time estimate %.1f ms), %llu ran late",
+                     vp ? 1e9 / double(vp) : 0.0, (unsigned long long)hf, hf ? hn / 1e6 / double(hf) : 0.0, gpu_est_ms_,
+                     (unsigned long long)hl);
+            }
             drain_ms_ = 0;
             rec_batches_ = 0;
         }
