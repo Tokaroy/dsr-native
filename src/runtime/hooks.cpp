@@ -706,7 +706,17 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     } else {
         deadline = now;
     }
-    const double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / fps;
+    double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / fps;
+    // present_mode mailbox pacing: each frame is shown for whole refreshes (one at the cap), at an even rhythm, but
+    // the moment the game thread passes here varies by a few ms (it waits for the render thread, the deadline
+    // moves): a time step of exactly what each frame is shown for keeps motion even (the measured one made the
+    // game move unevenly against even frames: micro stutter).
+    if (std::chrono::steady_clock::now().time_since_epoch().count() - g_present_slack_at.load(std::memory_order_relaxed) <
+            500'000'000 &&
+        !MoviePlaying()) {
+        const double p = 1.0 / fps;
+        seconds = std::max(1.0, std::round(seconds / p)) * p;
+    }
     last = now;
     // Up to 1/20 s per step (1/min_fps with fps = auto and min_fps 15): slower devices keep the game at normal speed
     // instead of slow motion.

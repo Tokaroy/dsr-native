@@ -47,6 +47,9 @@ struct RuntimeConfig {
     // mailbox_pacing: with present_mode mailbox, each frame is held back to finish half a refresh before the refresh
     // it is meant for (vk_backend.cpp, MailboxHold): no dropped or repeated frames, still no queue. 0 = plain mailbox.
     bool mailbox_pacing = true;
+    // mailbox_margin: how long before its refresh a paced frame is finished, in ms (0 = half a refresh). Smaller is
+    // less input latency, but a frame finishing after the compositor took its frame for the refresh drops.
+    double mailbox_margin_ms = 0;
     std::string present_mode = "fifo";  // swapchain present mode: fifo (vsync, default), mailbox, fifo_relaxed, immediate (FIFO if unsupported)
     bool lrz_workaround = false;
     bool shader_depth_test = true;  // depth tests against gl_FragDepth-written depth done in the shader (square holes)  // refresh depth buffers written by gl_FragDepth before reuse (square holes)

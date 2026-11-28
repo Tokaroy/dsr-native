@@ -591,6 +591,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 have_face_buttons = true;
             } else if (!strcmp(key, "mailbox_pacing")) {
                 cfg->mailbox_pacing = v != 0;
+            } else if (!strcmp(key, "mailbox_margin")) {
+                cfg->mailbox_margin_ms = std::clamp(atof(value), 0.0, 30.0);
             } else if (!strcmp(key, "present_mode")) {
                 cfg->present_mode = value;
                 have_present_mode = true;

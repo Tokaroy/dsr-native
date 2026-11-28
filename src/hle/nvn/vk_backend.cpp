@@ -2038,6 +2038,7 @@ private:
     // later until they arrive just before it: holding frames for most of a refresh added that much input latency.
     bool mailbox_ = false;
     int64_t mailbox_target_ = 0;  // the refresh the previous frame was meant for (steady_clock ns)
+    bool mailbox_prev_late_ = false;
     double gpu_est_ms_ = 0;       // GPU time of a frame's submission: rises at once, falls slowly
     std::atomic<uint64_t> hold_frames_{0}, hold_ns_{0}, hold_late_{0};  // recorder thread; read by the report
     static int64_t SteadyNs() {
@@ -2054,28 +2055,33 @@ private:
         const int fps = std::max(1, dsr::FrameRateNow());
         const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
         auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };  // next refresh
-        // Started now, the GPU work is done at now + gpu: the first refresh at least half a period after that.
-        const int64_t earliest = on_grid(now + gpu + vp / 2);
+        // How long before its refresh a frame must be finished (settings.txt mailbox_margin in ms; default half a
+        // refresh): the screen compositor takes the newest finished frame a little before each refresh.
+        const double margin_ms = dsr::GetRuntime().config.mailbox_margin_ms;
+        const int64_t margin = margin_ms > 0 ? std::min<int64_t>(int64_t(margin_ms * 1e6), vp - 1'000'000) : vp / 2;
+        // Started now, the GPU work is done at now + gpu: the first refresh at least `margin` after that.
+        const int64_t earliest = on_grid(now + gpu + margin);
         int64_t target = earliest;
         if (mailbox_target_ && mailbox_target_ + 8 * vp < earliest) mailbox_target_ = 0;  // after a pause: start over
         if (mailbox_target_) {
-            // This frame's slot: `spacing` refreshes after the previous one. Ready before it: wait for it (the frame
-            // limiter then starts the game's frames later); after it: the next possible refresh (late).
-            const int64_t slot = on_grid(mailbox_target_ + spacing * vp - vp / 2);
-            // Reported against the aim (1.5 ms early) and wrapped to within half a refresh of it: a frame 14 ms
-            // early is 2.7 ms late for the slot before, and moving the game 4.2 ms earlier catches that one (moving
-            // it 12.5 ms later, the unwrapped reading, kept the game behind the refreshes and dropped frames: the
-            // frames came 0.5 ms a frame slower than the screen while every late frame read as very early).
-            int64_t err = slot - vp / 2 - gpu - now - 1'500'000;
-            err -= ((err + vp / 2) >= 0 ? (err + vp / 2) / vp : (err + vp / 2 - vp + 1) / vp) * vp;
-            dsr::ReportPresentSlack(double(err + 1'500'000) / 1e6);
-            if (slot >= earliest) {
+            // This frame's slot: `spacing` refreshes after the previous one. Ready before it: wait for it; after it:
+            // the next possible refresh (late).
+            const int64_t slot = on_grid(mailbox_target_ + spacing * vp - margin);
+            const int64_t slack = slot - margin - gpu - now;
+            const bool late = slot < earliest;
+            // How early the frame was goes to the frame limiter, which starts the game's frames later (or earlier
+            // when late) until they arrive about 1.5 ms before their slot. Not for the frame after a late one: its
+            // slot moved a refresh on, so it reads as nearly a refresh early (a 58.5 fps spiral before).
+            if (late || !mailbox_prev_late_)
+                dsr::ReportPresentSlack(std::clamp(double(slack) / 1e6, -double(vp) / 1e6, double(vp) / 1e6));
+            mailbox_prev_late_ = late;
+            if (!late) {
                 target = slot;
             } else {
                 hold_late_++;
             }
         }
-        int64_t start = target - vp / 2 - gpu;
+        int64_t start = target - margin - gpu;
         if (start - now > 3 * vp) start = now + 3 * vp;  // bounded, whatever the estimates say
         if (start > now) {
             std::this_thread::sleep_for(std::chrono::nanoseconds(start - now));
