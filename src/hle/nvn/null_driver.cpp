@@ -59,8 +59,13 @@ FormatInfo GetFormatInfo(int f) {
     return {1, 1, 8};                           // unknown: generous
 }
 
-// Bumped on every change of the registered pools (GuestRangeValid's per-thread caches; backend.h).
+// Bumped when registered memory shrinks (a pool destroyed or re-created smaller): GuestRangeValid's per-thread
+// caches (backend.h) start over.
 std::atomic<uint64_t> g_pool_ranges_version{1};
+namespace {
+std::atomic<uint64_t> g_pool_ranges_added{0};  // pools created: refreshes the pool list, keeps the caches
+std::atomic<uint64_t> g_pool_removed_stat{0}, g_range_evicted{0};
+}  // namespace
 
 namespace {
 constexpr const char* kTag = "nvn.null";
@@ -224,8 +229,14 @@ bool PoolInitialize(void* pool, const void* b) {
     g_pools.Get(pool) = s;
     if (s.storage) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
-        g_pool_ranges[reinterpret_cast<uintptr_t>(s.storage)] = s.size;
-        g_pool_ranges_version++;
+        auto [it, fresh] = g_pool_ranges.try_emplace(reinterpret_cast<uintptr_t>(s.storage), s.size);
+        if (!fresh && it->second != s.size) {  // re-created at the same address without being destroyed
+            if (s.size < it->second) g_pool_ranges_version++;
+            it->second = s.size;
+        }
+        // A new pool leaves every cached answer true: only the pool list is refreshed (on a thread's next miss),
+        // the per-thread caches are kept (they were emptied on every pool the game created).
+        g_pool_ranges_added.fetch_add(1, std::memory_order_release);
     }
     return true;
 }
@@ -235,6 +246,7 @@ void PoolFinalize(void* pool) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
         g_pool_ranges.erase(reinterpret_cast<uintptr_t>(s.storage));
         g_pool_ranges_version++;
+        g_pool_removed_stat.fetch_add(1, std::memory_order_relaxed);
     }
     g_pools.Erase(pool);
 }
@@ -746,7 +758,14 @@ void CheckWatchedTextures() {
 
 std::atomic<uint64_t> g_range_slow{0}, g_range_outside{0};
 std::atomic<size_t> g_range_merged{0};  // the pools merged into contiguous blocks (last rebuild)
-void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks) {
+void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks, uint64_t* added,
+                         uint64_t* removed, uint64_t* evicted) {
+    static uint64_t last_added = 0;
+    const uint64_t a = g_pool_ranges_added.load(std::memory_order_relaxed);
+    *added = a - last_added;
+    last_added = a;
+    *removed = g_pool_removed_stat.exchange(0, std::memory_order_relaxed);
+    *evicted = g_range_evicted.exchange(0, std::memory_order_relaxed);
     *blocks = g_range_merged.load(std::memory_order_relaxed);
     *slow = g_range_slow.exchange(0, std::memory_order_relaxed);
     *outside = g_range_outside.exchange(0, std::memory_order_relaxed);
@@ -764,12 +783,14 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
     struct Range {
         uintptr_t lo, hi;
     };
-    thread_local uint64_t cached_version = 0;
+    thread_local uint64_t cached_version = 0, cached_added = ~uint64_t(0);
     thread_local std::vector<Range> ranges;
     if (addr + size < addr) return false;
     const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
-    if (version != cached_version) {
+    const uint64_t added = g_pool_ranges_added.load(std::memory_order_acquire);
+    if (version != cached_version || added != cached_added) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+        cached_added = g_pool_ranges_added.load(std::memory_order_relaxed);
         ranges.clear();
         // The game places thousands of pools back to back in a few large heap blocks: touching or overlapping
         // pools are merged, so one cache entry covers a whole block (a range spanning two adjacent pools is
@@ -800,6 +821,7 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
         cache->version = cached_version;
     }
     const unsigned slot = GuestRangeCache::Slot(lo);
+    if (cache->hi[slot]) g_range_evicted.fetch_add(1, std::memory_order_relaxed);
     cache->lo[slot] = p.lo;
     cache->hi[slot] = p.hi;
     return true;

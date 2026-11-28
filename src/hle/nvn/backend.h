@@ -200,8 +200,10 @@ struct GuestRangeCache {
     uint64_t version = 0;
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
-// Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered.
-void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks);
+// Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered,
+// pools created / destroyed, cache entries replaced by another pool's.
+void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks, uint64_t* added,
+                         uint64_t* removed, uint64_t* evicted);
 GuestRangeCache* NewGuestRangeCache();
 inline bool GuestRangeValid(uint64_t addr, size_t size) {
     static thread_local GuestRangeCache* cache = nullptr;

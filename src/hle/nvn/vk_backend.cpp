@@ -705,7 +705,18 @@ public:
 
     // The commands of a list, in order; called lists (CallList) are executed in place.
     void ExecuteCommands(const CmdList& cmds, int depth) {
-        for (const Cmd& c : cmds) {
+        // The commands were written by the game's recording threads: their memory is in other cores' caches,
+        // and most commands (binds) do little else than read it (a profile put ~10% of the render thread on the
+        // first loads of bind commands). The commands a few ahead are fetched while this one runs.
+        constexpr size_t kAhead = 4;
+        const Cmd* const base = cmds.data();
+        const size_t count = cmds.size();
+        for (size_t ci = 0; ci < count; ci++) {
+            if (ci + kAhead < count) {
+                const char* ahead = reinterpret_cast<const char*>(base + ci + kAhead);
+                for (size_t b = 0; b < sizeof(Cmd); b += 64) __builtin_prefetch(ahead + b);
+            }
+            const Cmd& c = base[ci];
             switch (c.type) {
                 case CmdType::CallList:
                     if (c.obj && depth < 8) ExecuteCommands(*static_cast<const CmdList*>(c.obj.get()), depth + 1);
@@ -8034,10 +8045,12 @@ private:
         {
             uint64_t slow = 0, outside = 0;
             size_t pools = 0, blocks = 0;
-            TakeGuestRangeStats(&slow, &outside, &pools, &blocks);
+            uint64_t added = 0, removed = 0, evicted = 0;
+            TakeGuestRangeStats(&slow, &outside, &pools, &blocks, &added, &removed, &evicted);
             LOGI(kTag, "game memory checks (last 10 s): %llu not answered by the per-thread cache, %llu of them outside "
-                 "every memory pool (%zu pools in %zu contiguous blocks)", (unsigned long long)slow,
-                 (unsigned long long)outside, pools, blocks);
+                 "every memory pool, %llu replaced another pool's entry (%zu pools: %llu created, %llu destroyed)",
+                 (unsigned long long)slow, (unsigned long long)outside, (unsigned long long)evicted, pools,
+                 (unsigned long long)added, (unsigned long long)removed);
         }
         if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
