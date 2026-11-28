@@ -56,6 +56,8 @@ struct BlockedScope {
     ~BlockedScope() { NoteBlocked(false); }
 };
 void DumpGuestThreads(const char* why);
+// The calling guest thread's name (null on host threads the game never saw).
+const char* CurrentThreadName();
 // In an HLE function the guest calls directly: its return address, and the caller's frame record (saved x29).
 #define DSR_NOTE_WAIT(kind, obj)                                                                    \
     ::dsr::hle::os::NoteWaitCall(kind, obj, reinterpret_cast<uintptr_t>(__builtin_return_address(0)), \

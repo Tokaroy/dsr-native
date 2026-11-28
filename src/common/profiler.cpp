@@ -258,6 +258,53 @@ struct SlowFrame {
 std::mutex g_slow_mutex;
 std::vector<SlowFrame> g_slow;
 
+// ---- blocked spans (NoteBlockedSpan) ----
+struct BlockedSpan {
+    int64_t from, to;
+    uintptr_t where;
+    char who[24];
+    char what[72];
+};
+constexpr size_t kMaxSpans = 1024;
+std::mutex g_span_mutex;
+BlockedSpan g_spans[kMaxSpans];
+size_t g_span_next = 0;
+std::atomic<void (*)()> g_report_hook{nullptr};
+
+// The spans that covered much of [from, to]: a thread waiting through most of the frame (but not a worker that
+// idles for seconds anyway), or any slow file system call in it.
+std::string BlockedIn(int64_t from, int64_t to) {
+    struct Hit {
+        int64_t overlap;
+        BlockedSpan s;
+    };
+    std::vector<Hit> hits;
+    const int64_t len = to - from;
+    {
+        std::lock_guard<std::mutex> lk(g_span_mutex);
+        const size_t n = std::min(g_span_next, kMaxSpans);
+        for (size_t i = 0; i < n; i++) {
+            const BlockedSpan& b = g_spans[i];
+            const int64_t ov = std::min(b.to, to) - std::max(b.from, from);
+            if (ov <= 0) continue;
+            const bool fs = strncmp(b.what, "fs ", 3) == 0;
+            if (!fs && (ov * 10 < len * 4 || b.to - b.from > len * 4 + 50'000'000)) continue;
+            hits.push_back({ov, b});
+        }
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.overlap > b.overlap; });
+    std::string out;
+    for (size_t i = 0; i < hits.size() && i < 6; i++) {
+        const BlockedSpan& b = hits[i].s;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s%s %.0f ms in %s (from %s, %.0f ms before the frame's end)", out.empty() ? "" : " | ",
+                 b.who, (b.to - b.from) / 1e6, b.what, b.where ? Locate(b.where).label.c_str() : "?",
+                 (to - b.to) / 1e6);
+        out += buf;
+    }
+    return out;
+}
+
 void ReportSlowFrames() {
     std::vector<SlowFrame> todo;
     {
@@ -301,6 +348,8 @@ void ReportSlowFrames() {
             line += b;
         }
         LOGI(kTag, "%s (%.1f ms): %s", f.what, f.ms, line.empty() ? "no thread used the CPU much (waiting?)" : line.c_str());
+        const std::string blocked = BlockedIn(f.from, f.to);
+        if (!blocked.empty()) LOGI(kTag, "  blocked during it: %s", blocked.c_str());
     }
 }
 
@@ -312,7 +361,10 @@ void StartReporter() {
         for (int i = 1;; i++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             ReportSlowFrames();
-            if (i % 10 == 0) Report();
+            if (i % 10 == 0) {
+                Report();
+                if (auto hook = g_report_hook.load()) hook();
+            }
         }
     }).detach();
 }
@@ -345,6 +397,19 @@ void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms, const char* what) 
     std::lock_guard<std::mutex> lk(g_slow_mutex);
     if (g_slow.size() < 32) g_slow.push_back({from_ns, to_ns, ms, what});
 }
+
+void NoteBlockedSpan(const char* who, const char* what, uintptr_t where, int64_t from_ns, int64_t to_ns) {
+    if (!g_enabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_span_mutex);
+    BlockedSpan& b = g_spans[g_span_next++ % kMaxSpans];
+    b.from = from_ns;
+    b.to = to_ns;
+    b.where = where;
+    snprintf(b.who, sizeof(b.who), "%s", who ? who : "?");
+    snprintf(b.what, sizeof(b.what), "%s", what ? what : "?");
+}
+
+void SetReportHook(void (*hook)()) { g_report_hook.store(hook); }
 
 void Enable() {
 #ifdef DSR_PROFILER_SUPPORTED

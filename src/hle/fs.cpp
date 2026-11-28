@@ -6,7 +6,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <set>
 #include <cerrno>
 #include <cstring>
 #include <mutex>
@@ -15,6 +19,8 @@
 #include <vector>
 
 #include "common/log.h"
+#include "common/profiler.h"
+#include "hle/os/os.h"
 #include "hle/os/write_watch.h"
 #include "hle/registry.h"
 #include "runtime/runtime.h"
@@ -45,6 +51,7 @@ struct HostFile {
     int fd;
     int mode;
     std::string path;
+    bool dirty = false;  // written since opened (fsynced by CommitSaveData)
 };
 struct HostDir {
     std::vector<std::pair<std::string, struct stat>> entries;
@@ -119,6 +126,102 @@ int RemoveTree(const std::string& path) {
     closedir(d);
     return rmdir(path.c_str());
 }
+
+// ---- stutter diagnostics: time spent in file system calls -------------------------------------------
+// Every call is timed (two clock reads; calls are thousands per second at most). Each kind is summed for the
+// 10 s report; a call of 4 ms or more goes to the profiler, which lists it under a slow frame it overlapped.
+enum FsKind { kFsRead, kFsWrite, kFsOpen, kFsFlush, kFsCommit, kFsMeta, kFsKinds };
+const char* const kFsKindNames[kFsKinds] = {"reads", "writes", "opens", "flushes", "save commits", "other"};
+struct FsStat {
+    std::atomic<uint64_t> calls{0}, ns{0}, max_ns{0}, slow{0}, bytes{0};
+};
+FsStat g_fs_stats[kFsKinds];
+
+int64_t FsNow() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+const char* BaseName(const std::string& p) {
+    const size_t s = p.find_last_of('/');
+    return s == std::string::npos ? p.c_str() : p.c_str() + s + 1;
+}
+// Times one call; `detail` (a file name) and `bytes` describe it in the slow-call report.
+struct FsTimer {
+    FsKind kind;
+    uintptr_t caller;
+    const char* detail;
+    size_t bytes;
+    int64_t t0 = FsNow();
+    FsTimer(FsKind k, uintptr_t ret, const char* d = nullptr, size_t b = 0) : kind(k), caller(ret), detail(d), bytes(b) {}
+    ~FsTimer() {
+        const int64_t t1 = FsNow(), ns = t1 - t0;
+        FsStat& st = g_fs_stats[kind];
+        st.calls.fetch_add(1, std::memory_order_relaxed);
+        st.ns.fetch_add(uint64_t(ns), std::memory_order_relaxed);
+        st.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        uint64_t m = st.max_ns.load(std::memory_order_relaxed);
+        while (uint64_t(ns) > m && !st.max_ns.compare_exchange_weak(m, uint64_t(ns), std::memory_order_relaxed)) {
+        }
+        if (ns >= 4'000'000) {
+            st.slow.fetch_add(1, std::memory_order_relaxed);
+            char what[72];
+            if (bytes)
+                snprintf(what, sizeof(what), "fs %s %s (%zu KB)", kFsKindNames[kind], detail ? detail : "", bytes >> 10);
+            else
+                snprintf(what, sizeof(what), "fs %s %s", kFsKindNames[kind], detail ? detail : "");
+            const char* who = dsr::hle::os::CurrentThreadName();
+            dsr::profiler::NoteBlockedSpan(who ? who : "host", what, caller, t0, t1);
+        }
+    }
+};
+#define FS_TIMED(...) FsTimer fs_timer_(__VA_ARGS__)
+#define FS_CALLER reinterpret_cast<uintptr_t>(__builtin_return_address(0))
+
+void FsReport() {
+    std::string line;
+    for (int k = 0; k < kFsKinds; k++) {
+        FsStat& st = g_fs_stats[k];
+        const uint64_t calls = st.calls.exchange(0), ns = st.ns.exchange(0), mx = st.max_ns.exchange(0),
+                       slow = st.slow.exchange(0), bytes = st.bytes.exchange(0);
+        if (!calls) continue;
+        char b[160];
+        snprintf(b, sizeof(b), "%s%s %llu (%.0f ms, longest %.1f ms, %llu over 4 ms%s", line.empty() ? "" : "; ",
+                 kFsKindNames[k], (unsigned long long)calls, ns / 1e6, mx / 1e6, (unsigned long long)slow,
+                 bytes ? "" : ")");
+        line += b;
+        if (bytes) {
+            snprintf(b, sizeof(b), ", %.1f MB)", bytes / 1048576.0);
+            line += b;
+        }
+    }
+    if (!line.empty()) LOGI(kTag, "file system calls (last 10 s): %s", line.c_str());
+}
+struct FsReportInstall {
+    FsReportInstall() { dsr::profiler::SetReportHook(FsReport); }
+} g_fs_report_install;
+
+// ---- save commits ----------------------------------------------------------------------------------
+// CommitSaveData flushed the whole device (sync()): every pending write of every app, our texture and shader
+// caches included, while the game autosaves every few seconds. It now flushes what the game changed since the
+// last commit: the files it wrote (fsync) and the directories whose entries changed.
+std::mutex g_dirty_mutex;
+std::set<std::string> g_dirty_files, g_dirty_dirs;
+void MarkDirtyFile(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_dirty_mutex);
+    g_dirty_files.insert(path);
+}
+void MarkDirtyDir(const std::string& path) {
+    const size_t s = path.find_last_of('/');
+    std::lock_guard<std::mutex> lk(g_dirty_mutex);
+    g_dirty_dirs.insert(s == std::string::npos ? std::string(".") : path.substr(0, s));
+}
+int SyncPath(const std::string& path, bool dir) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | (dir ? O_DIRECTORY : 0));
+    if (fd < 0) return errno == ENOENT ? 0 : errno;  // deleted since: nothing to keep
+    const int r = fsync(fd) == 0 ? 0 : errno;
+    close(fd);
+    return r;
+}
 }  // namespace
 
 namespace dsr::hle::fs {
@@ -145,7 +248,18 @@ HLE_FUNC(_ZN2nn2fs7UnmountEPKc, void, fs_Unmount, (const char* name)) {
     g_mounts.erase(name);
 }
 HLE_FUNC(_ZN2nn2fs14CommitSaveDataEPKc, uint32_t, fs_CommitSaveData, (const char*)) {
-    sync();
+    FS_TIMED(kFsCommit, FS_CALLER);
+    std::set<std::string> files, dirs;
+    {
+        std::lock_guard<std::mutex> lk(g_dirty_mutex);
+        files.swap(g_dirty_files);
+        dirs.swap(g_dirty_dirs);
+    }
+    int err = 0;
+    for (const std::string& f : files) err = err ? err : SyncPath(f, false);
+    for (const std::string& d : dirs) err = err ? err : SyncPath(d, true);
+    static int logged = 0;
+    if (err && logged++ < 5) LOGW(kTag, "CommitSaveData: flushing the save failed: %s", strerror(err));
     return kOk;
 }
 HLE_FUNC(_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE, void, fs_SetAllocator, (const void*, const void*)) {}
@@ -153,18 +267,20 @@ HLE_FUNC(_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE, void, fs_SetAllocator, (const v
 // ---- files ----------------------------------------------------------------------------------------
 HLE_FUNC(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci, uint32_t, fs_OpenFile, (void** out, const char* path, int mode)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsOpen, FS_CALLER, BaseName(host));
     int flags = (mode & kWrite) ? ((mode & kRead) ? O_RDWR : O_WRONLY) : O_RDONLY;
     int fd = open(host.c_str(), flags | O_CLOEXEC);
     if (fd < 0) {
         LOGD(kTag, "OpenFile('%s') failed: %s", path, strerror(errno));
         return FromErrno(errno);
     }
-    *out = new HostFile{fd, mode, host};
+    *out = new HostFile{fd, mode, host, false};
     LOGD(kTag, "OpenFile('%s', %d) -> fd %d", path, mode, fd);
     return kOk;
 }
 HLE_FUNC(_ZN2nn2fs9CloseFileENS0_10FileHandleE, void, fs_CloseFile, (HostFile * f)) {
     if (!f) return;
+    if (f->dirty) MarkDirtyFile(f->path);
     close(f->fd);
     delete f;
 }
@@ -202,6 +318,7 @@ static uint32_t ReadImpl(size_t* out, HostFile* f, int64_t off, void* buf, size_
 }
 HLE_FUNC(_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm, uint32_t, fs_ReadFile,
          (HostFile * f, int64_t off, void* buf, size_t size)) {
+    FS_TIMED(kFsRead, FS_CALLER, BaseName(f->path), size);
     size_t n = 0;
     uint32_t r = ReadImpl(&n, f, off, buf, size, true);
     if (r == kOk && n != size) return kOutOfRange;
@@ -209,10 +326,13 @@ HLE_FUNC(_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm, uint32_t, fs_ReadFile,
 }
 HLE_FUNC(_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm, uint32_t, fs_ReadFileOut,
          (size_t * out, HostFile* f, int64_t off, void* buf, size_t size)) {
+    FS_TIMED(kFsRead, FS_CALLER, BaseName(f->path), size);
     return ReadImpl(out, f, off, buf, size, false);
 }
 HLE_FUNC(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE, uint32_t, fs_WriteFile,
          (HostFile * f, int64_t off, const void* buf, size_t size, const int* option)) {
+    FS_TIMED(kFsWrite, FS_CALLER, BaseName(f->path), size);
+    f->dirty = true;
     if (!(f->mode & kAllowAppend)) {
         struct stat st;
         if (fstat(f->fd, &st) == 0 && off + int64_t(size) > st.st_size) return kFileExtensionWithoutOpenModeAllowAppend;
@@ -230,6 +350,7 @@ HLE_FUNC(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE, uint32_
     return kOk;
 }
 HLE_FUNC(_ZN2nn2fs9FlushFileENS0_10FileHandleE, uint32_t, fs_FlushFile, (HostFile * f)) {
+    FS_TIMED(kFsFlush, FS_CALLER, BaseName(f->path));
     fsync(f->fd);
     return kOk;
 }
@@ -240,10 +361,15 @@ HLE_FUNC(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE, uint32_t, fs_GetFileSize, (
     return kOk;
 }
 HLE_FUNC(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl, uint32_t, fs_SetFileSize, (HostFile * f, int64_t size)) {
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(f->path));
+    f->dirty = true;
     return ftruncate(f->fd, size) == 0 ? kOk : FromErrno(errno);
 }
 HLE_FUNC(_ZN2nn2fs10CreateFileEPKcl, uint32_t, fs_CreateFile, (const char* path, int64_t size)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
+    MarkDirtyFile(host);
+    MarkDirtyDir(host);
     int fd = open(host.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0664);
     if (fd < 0) return FromErrno(errno);
     uint32_t r = ftruncate(fd, size) == 0 ? kOk : FromErrno(errno);
@@ -252,11 +378,16 @@ HLE_FUNC(_ZN2nn2fs10CreateFileEPKcl, uint32_t, fs_CreateFile, (const char* path,
 }
 HLE_FUNC(_ZN2nn2fs10DeleteFileEPKc, uint32_t, fs_DeleteFile, (const char* path)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
+    MarkDirtyDir(host);
     return unlink(host.c_str()) == 0 ? kOk : FromErrno(errno);
 }
 HLE_FUNC(_ZN2nn2fs10RenameFileEPKcS2_, uint32_t, fs_RenameFile, (const char* from, const char* to)) {
     RESOLVE_OR_FAIL(from, a);
     RESOLVE_OR_FAIL(to, b);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(b));
+    MarkDirtyDir(a);
+    MarkDirtyDir(b);
     struct stat st;
     if (stat(b.c_str(), &st) == 0) return kPathAlreadyExists;
     return rename(a.c_str(), b.c_str()) == 0 ? kOk : FromErrno(errno);
@@ -265,19 +396,26 @@ HLE_FUNC(_ZN2nn2fs10RenameFileEPKcS2_, uint32_t, fs_RenameFile, (const char* fro
 // ---- directories ------------------------------------------------------------------------------------
 HLE_FUNC(_ZN2nn2fs15CreateDirectoryEPKc, uint32_t, fs_CreateDirectory, (const char* path)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
+    MarkDirtyDir(host);
     return mkdir(host.c_str(), 0775) == 0 ? kOk : FromErrno(errno);
 }
 HLE_FUNC(_ZN2nn2fs15DeleteDirectoryEPKc, uint32_t, fs_DeleteDirectory, (const char* path)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
+    MarkDirtyDir(host);
     return rmdir(host.c_str()) == 0 ? kOk : FromErrno(errno);
 }
 HLE_FUNC(_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc, uint32_t, fs_DeleteDirectoryRecursively, (const char* path)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
+    MarkDirtyDir(host);
     return RemoveTree(host) == 0 ? kOk : FromErrno(errno);
 }
 HLE_FUNC(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc, uint32_t, fs_GetEntryType,
          (int* out, const char* path)) {
     RESOLVE_OR_FAIL(path, host);
+    FS_TIMED(kFsMeta, FS_CALLER, BaseName(host));
     struct stat st;
     if (stat(host.c_str(), &st) != 0) return FromErrno(errno);
     *out = S_ISDIR(st.st_mode) ? 0 : 1;

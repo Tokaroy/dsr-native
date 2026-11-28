@@ -5,6 +5,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -399,9 +400,24 @@ void NoteBlocked(bool blocked) {
     if (blocked) {
         if (!t->blocked_since.load(std::memory_order_relaxed)) t->blocked_since.store(now, std::memory_order_relaxed);
     } else {
+        const int64_t since = t->blocked_since.load(std::memory_order_relaxed);
         t->blocked_since.store(0, std::memory_order_relaxed);
         t->unblocked_at.store(now, std::memory_order_relaxed);
+        // Stutter diagnostics: waits of 4 ms on (deliberate sleeps aside) go to the profiler, which lists the ones
+        // that covered a slow frame.
+        const char* kind = t->wait_kind.load(std::memory_order_relaxed);
+        if (since && now - since >= 4'000'000 && profiler::Enabled() && !(kind && strcmp(kind, "SleepThread") == 0)) {
+            char what[72];
+            snprintf(what, sizeof(what), "%s @%llx", kind ? kind : "a wait",
+                     (unsigned long long)t->wait_obj.load(std::memory_order_relaxed));
+            profiler::NoteBlockedSpan(t->name.c_str(), what, t->wait_ret.load(std::memory_order_relaxed), since, now);
+        }
     }
+}
+
+const char* CurrentThreadName() {
+    HostThread* t = t_current;
+    return t ? t->name.c_str() : nullptr;
 }
 
 void DumpGuestThreads(const char* why) {
