@@ -21,6 +21,7 @@
 
 #include "hle/input.h"
 #include "common/log.h"
+#include "common/profiler.h"
 #include "hle/os/heap.h"
 #include "hle/os/os.h"
 #include <atomic>
@@ -690,6 +691,23 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
         DynamicStep(std::chrono::duration<double, std::milli>(now - last).count());
     const int fps = FrameRateNow();
     const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
+    // Diagnostics: a game frame that took over 25 ms from its start to here (before any sleep) is logged, with
+    // what the game's threads ran on the CPU meanwhile (profiler, within a second). At most 20 per 10 s.
+    if (last.time_since_epoch().count() != 0 && !MoviePlaying()) {
+        const double work_ms = std::chrono::duration<double, std::milli>(now - last).count();
+        static int64_t window_start = 0;
+        static int in_window = 0;
+        const int64_t tn = now.time_since_epoch().count();
+        if (tn - window_start > 10'000'000'000) {
+            window_start = tn;
+            in_window = 0;
+        }
+        if (work_ms > 25.0 && work_ms < 2000.0 && in_window++ < 20) {
+            LOGI("hooks", "slow frame: %.1f ms from one frame's start to the next (the cap allows %.1f)", work_ms,
+                 1000.0 / fps);
+            profiler::NoteSlowFrame(last.time_since_epoch().count(), tn, work_ms);
+        }
+    }
     if (last.time_since_epoch().count() != 0) {
         // present_mode mailbox pacing: frames start on the display's refresh grid (one refresh apart at the cap,
         // so the rate is the screen's exactly: 59.8 Hz on a Thor, where a 60.0 fps schedule drifted against it)

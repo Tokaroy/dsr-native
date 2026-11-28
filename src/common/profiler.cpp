@@ -46,6 +46,7 @@ struct ThreadSlot {
 struct Sample {
     int16_t slot;
     uint8_t depth;
+    int64_t t_ns;  // CLOCK_MONOTONIC when taken
     uintptr_t pc[kDepth];  // pc, then return addresses (frame-pointer walk)
 };
 
@@ -74,6 +75,9 @@ void OnSignal(int, siginfo_t*, void* uc_) {
     const size_t at = g_write.fetch_add(1, std::memory_order_relaxed) & (kMaxSamples - 1);
     Sample& s = g_samples[at];
     s.slot = int16_t(slot);
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);  // async-signal-safe
+    s.t_ns = int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
     s.pc[0] = uintptr_t(uc->uc_mcontext.pc);
     int d = 1;
     s.pc[d++] = uintptr_t(uc->uc_mcontext.regs[30]);  // lr: the caller, when pc is in a leaf
@@ -232,14 +236,69 @@ void Report() {
     }
 }
 
+// ---- slow frames (NoteSlowFrame) ----
+struct SlowFrame {
+    int64_t from, to;
+    double ms;
+};
+std::mutex g_slow_mutex;
+std::vector<SlowFrame> g_slow;
+
+void ReportSlowFrames() {
+    std::vector<SlowFrame> todo;
+    {
+        std::lock_guard<std::mutex> lk(g_slow_mutex);
+        todo.swap(g_slow);
+    }
+    if (todo.empty()) return;
+    const size_t end = g_write.load();
+    const size_t begin = end > kMaxSamples ? end - kMaxSamples : 0;
+    for (const SlowFrame& f : todo) {
+        // Per thread: CPU samples in the window (each ~2 ms of its CPU time) and where in the game's code (or
+        // ours) they were.
+        const int n = g_nslots.load();
+        std::vector<int> count(n, 0);
+        std::vector<std::map<std::string, int>> where(n);
+        for (size_t i = begin; i < end; i++) {
+            const Sample& s = g_samples[i & (kMaxSamples - 1)];
+            if (s.t_ns < f.from || s.t_ns > f.to || s.slot < 0 || s.slot >= n) continue;
+            count[s.slot]++;
+            std::string label;
+            for (int d = 0; d < s.depth && label.empty(); d++) {
+                const uintptr_t a = d == 0 ? s.pc[0] : s.pc[d] - 4;
+                const Where x = Locate(a);
+                if (x.kind == 0) label = Locate(a & ~uintptr_t(63)).label;
+            }
+            if (label.empty()) label = Locate(s.pc[0] & ~uintptr_t(63)).label;
+            where[s.slot][label]++;
+        }
+        std::string line;
+        for (int slot = 0; slot < n; slot++) {
+            if (count[slot] < 2) continue;
+            std::vector<std::pair<int, std::string>> v;
+            for (auto& [k, c] : where[slot]) v.push_back({c, k});
+            std::sort(v.rbegin(), v.rend());
+            char b[512];
+            int len = snprintf(b, sizeof(b), "%s%s ~%d ms CPU [", line.empty() ? "" : " | ", g_slots[slot].name,
+                               count[slot] * 2);
+            for (size_t i = 0; i < v.size() && i < 3 && len < int(sizeof(b)) - 80; i++)
+                len += snprintf(b + len, sizeof(b) - len, "%s%s x%d", i ? ", " : "", v[i].second.c_str(), v[i].first);
+            snprintf(b + len, sizeof(b) - len, "]");
+            line += b;
+        }
+        LOGI(kTag, "slow frame (%.1f ms): %s", f.ms, line.empty() ? "no thread used the CPU much (waiting?)" : line.c_str());
+    }
+}
+
 void StartReporter() {
     static bool started = false;
     if (started) return;
     started = true;
     std::thread([] {
-        for (;;) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-            Report();
+        for (int i = 1;; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ReportSlowFrames();
+            if (i % 10 == 0) Report();
         }
     }).detach();
 }
@@ -266,6 +325,12 @@ void StartTimer(ThreadSlot& t) {
 }  // namespace
 
 bool Enabled() { return g_enabled.load(); }
+
+void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms) {
+    if (!g_enabled.load()) return;
+    std::lock_guard<std::mutex> lk(g_slow_mutex);
+    if (g_slow.size() < 32) g_slow.push_back({from_ns, to_ns, ms});
+}
 
 void Enable() {
 #ifdef DSR_PROFILER_SUPPORTED
