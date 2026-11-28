@@ -2062,7 +2062,13 @@ private:
             // This frame's slot: `spacing` refreshes after the previous one. Ready before it: wait for it (the frame
             // limiter then starts the game's frames later); after it: the next possible refresh (late).
             const int64_t slot = on_grid(mailbox_target_ + spacing * vp - vp / 2);
-            dsr::ReportPresentSlack(double(slot - vp / 2 - gpu - now) / 1e6);
+            // Reported against the aim (1.5 ms early) and wrapped to within half a refresh of it: a frame 14 ms
+            // early is 2.7 ms late for the slot before, and moving the game 4.2 ms earlier catches that one (moving
+            // it 12.5 ms later, the unwrapped reading, kept the game behind the refreshes and dropped frames: the
+            // frames came 0.5 ms a frame slower than the screen while every late frame read as very early).
+            int64_t err = slot - vp / 2 - gpu - now - 1'500'000;
+            err -= ((err + vp / 2) >= 0 ? (err + vp / 2) / vp : (err + vp / 2 - vp + 1) / vp) * vp;
+            dsr::ReportPresentSlack(double(err + 1'500'000) / 1e6);
             if (slot >= earliest) {
                 target = slot;
             } else {
