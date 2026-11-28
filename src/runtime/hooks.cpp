@@ -595,6 +595,7 @@ std::atomic<int> g_cap_fps{60};  // the rate the limiter paces to with fps = aut
 std::atomic<float> g_gpu_frame_ms{0.0f};
 std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, ms
 std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
+std::atomic<int64_t> g_refresh_last{0}, g_refresh_period{0};  // ReportDisplayRefresh
 bool MoviePlaying() { return g_movies.load(std::memory_order_relaxed) > 0; }
 int MovieFps() { return g_build ? g_build->movie_fps : 30; }
 int MinFps() { return std::clamp(GetRuntime().config.min_fps, 15, 30); }
@@ -685,20 +686,31 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     const int fps = FrameRateNow();
     const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
     if (last.time_since_epoch().count() != 0) {
-        deadline += period;
-        // present_mode mailbox pacing: frames ready long before their slot waited for it there (a refresh of added
-        // latency, input read that much earlier); late ones slip a refresh. The deadline moves (at most 0.5 ms a
-        // frame) until frames are ready about 1.5 ms before their slot.
-        {
-            const int64_t t = std::chrono::steady_clock::now().time_since_epoch().count();
-            if (t - g_present_slack_at.load(std::memory_order_relaxed) < 500'000'000) {
-                const double adjust = std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - 1.5) * 0.15, -0.5, 0.5);
-                deadline += std::chrono::nanoseconds(int64_t(adjust * 1e6));
-            }
+        // present_mode mailbox pacing: frames start on the display's refresh grid (one refresh apart at the cap,
+        // so the rate is the screen's exactly: 59.8 Hz on a Thor, where a 60.0 fps schedule drifted against it)
+        // plus a phase. Frames ready long before their slot waited there (input read that much earlier), late ones
+        // slip a refresh: the phase moves (at most 0.5 ms a frame) until frames are ready about 1.5 ms before
+        // their slot. Moving only the phase, the rate cannot drift away from the screen's whatever the readings.
+        const int64_t tn = now.time_since_epoch().count();
+        const int64_t vs = g_refresh_last.load(std::memory_order_acquire), vp = g_refresh_period.load(std::memory_order_relaxed);
+        static int64_t grid = 0;  // the refresh the previous frame started on
+        static double phase_ms = 0;
+        if (vp > 0 && tn - vs < 8 * vp && tn - g_present_slack_at.load(std::memory_order_relaxed) < 500'000'000) {
+            const int64_t spacing = std::max<int64_t>(1, std::llround(double(period.count()) / double(vp)));
+            auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };
+            int64_t next = grid ? on_grid(grid + spacing * vp - vp / 2) : 0;
+            if (!next || next < tn - 4 * vp) next = on_grid(tn);  // first frame, or after a stall: from now
+            phase_ms += std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - 1.5) * 0.15, -0.5, 0.5);
+            phase_ms = std::clamp(phase_ms, -double(vp) / 1e6, double(vp) / 1e6);
+            grid = next;
+            deadline = clock::time_point(std::chrono::nanoseconds(next + int64_t(phase_ms * 1e6)));
+        } else {
+            grid = 0;
+            deadline += period;
+            // More than half a period behind (a hitch, a loading stall, a lower rate than before, the game held by
+            // the menu): the schedule starts again from now instead of rushing frames out to catch up.
+            if (now > deadline + period / 2) deadline = now;
         }
-        // More than half a period behind (a hitch, a loading stall, a lower rate than before, the game held by the
-        // menu): the schedule starts again from now instead of rushing frames out to catch up.
-        if (now > deadline + period / 2) deadline = now;
         if (now < deadline) {
             std::this_thread::sleep_until(deadline);
             now = clock::now();
@@ -846,6 +858,10 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+void ReportDisplayRefresh(int64_t last_ns, int64_t period_ns) {
+    g_refresh_period.store(period_ns, std::memory_order_relaxed);
+    g_refresh_last.store(last_ns, std::memory_order_release);
+}
 void ReportPresentSlack(double ms) {
     const float prev = g_present_slack_ms.load(std::memory_order_relaxed);
     const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();

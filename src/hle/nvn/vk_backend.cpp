@@ -675,6 +675,7 @@ private:
                 period_.store(p ? p + (d - p) / 8 : d, std::memory_order_release);
         }
         last_.store(t, std::memory_order_release);
+        dsr::ReportDisplayRefresh(t, period_.load(std::memory_order_relaxed));
         AChoreographer_postFrameCallback64(choreographer_, &Callback, this);
     }
     void Run() {

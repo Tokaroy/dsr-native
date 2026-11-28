@@ -214,6 +214,9 @@ void ReportGpuFrameTime(double ms);
 // late). The frame limiter moves the game's frames by it, so they are ready just before their slot instead of
 // waiting (that wait was a refresh of added latency).
 void ReportPresentSlack(double ms);
+// The display's last refresh (steady_clock / CLOCK_MONOTONIC ns) and refresh period, from the Vulkan backend's
+// AChoreographer thread (present_mode mailbox): the frame limiter then starts frames on the refresh grid.
+void ReportDisplayRefresh(int64_t last_ns, int64_t period_ns);
 // Whether the GPU samples BC textures itself (natively or through BCeNabler): 1 yes, 0 no (converted on the CPU),
 // -1 not known yet (no Vulkan device). The menu turns texture_mip_skip on with performance mode only without BC.
 void SetGpuHasBc(bool has);
