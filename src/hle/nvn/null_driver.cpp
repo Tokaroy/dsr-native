@@ -745,7 +745,9 @@ void CheckWatchedTextures() {
 }
 
 std::atomic<uint64_t> g_range_slow{0}, g_range_outside{0};
-void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools) {
+std::atomic<size_t> g_range_merged{0};  // the pools merged into contiguous blocks (last rebuild)
+void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_t* blocks) {
+    *blocks = g_range_merged.load(std::memory_order_relaxed);
     *slow = g_range_slow.exchange(0, std::memory_order_relaxed);
     *outside = g_range_outside.exchange(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
@@ -766,7 +768,15 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
     if (version != cached_version) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
         ranges.clear();
-        for (const auto& [base, sz] : g_pool_ranges) ranges.push_back({base, base + sz});
+        // The game places thousands of pools back to back in a few large heap blocks: touching or overlapping
+        // pools are merged, so one cache entry covers a whole block (a range spanning two adjacent pools is
+        // still inside guest memory the game registered).
+        for (const auto& [base, sz] : g_pool_ranges) {
+            const uintptr_t b = uintptr_t(base), e = uintptr_t(base + sz);
+            if (!ranges.empty() && b <= ranges.back().hi) ranges.back().hi = std::max(ranges.back().hi, e);
+            else ranges.push_back({b, e});
+        }
+        g_range_merged.store(ranges.size(), std::memory_order_relaxed);
         cached_version = g_pool_ranges_version.load(std::memory_order_relaxed);
     }
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);

@@ -4108,10 +4108,35 @@ private:
     static constexpr size_t kHeadBytes = (sizeof(OpHead) + 15) & ~size_t(15);
     static constexpr size_t kBatchBytes = 64 << 10;
     OpBatch* rec_batch_ = nullptr;     // being filled (render thread)
-    std::deque<OpBatch*> rec_queue_;   // under rec_mutex_
-    std::vector<OpBatch*> rec_free_;   // under rec_mutex_
-    bool rec_sleeping_ = false;        // under rec_mutex_: the recorder waits on rec_cv_
+    // Batches handed to the recorder and returned by it: single-producer / single-consumer rings, so a handoff
+    // takes no lock (the mutex below is only for the recorder going to sleep and being woken). The lock was
+    // taken four times per batch (~12,000 batches per 10 s) and was the render thread's main system-call site.
+    template <size_t N>
+    struct SpscRing {
+        OpBatch* slot[N] = {};
+        alignas(64) std::atomic<size_t> head{0};  // next to read (consumer)
+        alignas(64) std::atomic<size_t> tail{0};  // next to write (producer)
+        bool Push(OpBatch* b) {
+            const size_t t = tail.load(std::memory_order_relaxed);
+            if (t - head.load(std::memory_order_acquire) >= N) return false;
+            slot[t % N] = b;
+            tail.store(t + 1, std::memory_order_release);
+            return true;
+        }
+        OpBatch* Pop() {
+            const size_t h = head.load(std::memory_order_relaxed);
+            if (h == tail.load(std::memory_order_acquire)) return nullptr;
+            OpBatch* b = slot[h % N];
+            head.store(h + 1, std::memory_order_release);
+            return b;
+        }
+        bool Empty() const { return head.load(std::memory_order_acquire) == tail.load(std::memory_order_acquire); }
+    };
+    SpscRing<1024> rec_queue_;         // render thread -> recorder
+    SpscRing<1024> rec_free_;          // recorder -> render thread (emptied batches to reuse)
+    std::atomic<bool> rec_sleeping_{false};  // the recorder waits (or is about to) on rec_cv_
     std::atomic<int> rec_queued_{0};   // batches in rec_queue_
+    uint64_t rec_wakes_ = 0;           // render thread: times it had to wake the recorder
     std::atomic<bool> rec_busy_{false};
     std::mutex rec_mutex_;
     std::condition_variable rec_cv_;
@@ -4155,28 +4180,26 @@ private:
                         spin_us = std::max(spin_us / 2, 15);
                     }
                 }
-                OpBatch* b;
-                {
+                if (rec_queue_.Empty()) {
+                    // Announced before the last look at the queue (both sides use sequentially consistent
+                    // operations): a batch published after that look sees the flag and wakes us.
                     std::unique_lock<std::mutex> lk(rec_mutex_);
-                    if (rec_queue_.empty()) {
-                        rec_sleeping_ = true;
-                        rec_cv_.wait(lk, [&] { return !rec_queue_.empty() || quit_.load(); });
-                        rec_sleeping_ = false;
-                        if (rec_queue_.empty()) return;  // Abandon
-                    }
-                    b = rec_queue_.front();
-                    rec_queue_.pop_front();
-                    rec_busy_.store(true, std::memory_order_relaxed);
-                    rec_queued_.fetch_sub(1, std::memory_order_release);  // publishes rec_busy_ = true
+                    rec_sleeping_.store(true, std::memory_order_seq_cst);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    rec_cv_.wait(lk, [&] { return !rec_queue_.Empty() || quit_.load(); });
+                    rec_sleeping_.store(false, std::memory_order_relaxed);
+                    if (rec_queue_.Empty()) return;  // Abandon
                 }
+                OpBatch* b = rec_queue_.Pop();
+                rec_busy_.store(true, std::memory_order_relaxed);
+                rec_queued_.fetch_sub(1, std::memory_order_release);  // publishes rec_busy_ = true
                 const auto t0 = std::chrono::steady_clock::now();
                 RunBatch(*b);
                 rec_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                         std::chrono::steady_clock::now() - t0).count());
-                {
-                    std::lock_guard<std::mutex> lk(rec_mutex_);
-                    rec_free_.push_back(b);
-                }
+                b->used = 0;
+                b->ops = 0;
+                if (!rec_free_.Push(b)) delete b;
                 rec_busy_.store(false, std::memory_order_release);  // Drain() sees everything recorded so far
             }
         }).detach();
@@ -4198,13 +4221,7 @@ private:
         const size_t total = kHeadBytes + ((payload + 15) & ~size_t(15));
         if (rec_batch_ && rec_batch_->used + total > rec_batch_->cap) Publish();
         if (!rec_batch_) {
-            {
-                std::lock_guard<std::mutex> lk(rec_mutex_);
-                if (!rec_free_.empty()) {
-                    rec_batch_ = rec_free_.back();
-                    rec_free_.pop_back();
-                }
-            }
+            rec_batch_ = rec_free_.Pop();
             if (!rec_batch_) rec_batch_ = new OpBatch;
             const size_t cap = std::max(total, kBatchBytes);
             if (rec_batch_->cap < cap) {
@@ -4222,16 +4239,16 @@ private:
     void Publish() {
         if (!rec_batch_) return;
         if (!rec_batch_->ops) return;
-        bool wake;
-        {
-            std::lock_guard<std::mutex> lk(rec_mutex_);
-            rec_queue_.push_back(rec_batch_);
-            rec_queued_.fetch_add(1, std::memory_order_release);
-            wake = rec_sleeping_;
-        }
+        rec_queued_.fetch_add(1, std::memory_order_release);  // before the push: Drain() never sees it idle early
+        while (!rec_queue_.Push(rec_batch_)) CpuRelax();     // 1024 batches behind: wait for the recorder
         rec_batch_ = nullptr;
         rec_batches_++;
-        if (wake) rec_cv_.notify_one();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (rec_sleeping_.load(std::memory_order_seq_cst)) {
+            rec_wakes_++;
+            std::lock_guard<std::mutex> lk(rec_mutex_);
+            rec_cv_.notify_one();
+        }
     }
     // Publishes small batches so the recorder starts early (about 32 draws' worth).
     void MaybePublish() {
@@ -7979,9 +7996,9 @@ private:
         last_report_ = now;
         Drain();  // the recorder's counters below
         if (rec_started_) {
-            LOGI(kTag, "recorder thread: busy %.0f ms in the last 10 s; render thread waited %.0f ms for it; %llu batches; "
-                 "%llu extra descriptor pools; %llu draws without descriptor sets",
-                 rec_ns_.exchange(0) / 1e6, drain_ms_, (unsigned long long)rec_batches_,
+            LOGI(kTag, "recorder thread: busy %.0f ms in the last 10 s; render thread waited %.0f ms for it; %llu batches "
+                 "(%llu woke it); %llu extra descriptor pools; %llu draws without descriptor sets",
+                 rec_ns_.exchange(0) / 1e6, drain_ms_, (unsigned long long)rec_batches_, (unsigned long long)rec_wakes_,
                  (unsigned long long)desc_pools_added_, (unsigned long long)skipped_desc_);
             LOGI(kTag, "recorder in the driver (last 10 s): image acquire %s; present %s; submit %s",
                  t_acquire_.Take().c_str(), t_present_.Take().c_str(), t_submit_.Take().c_str());
@@ -8001,6 +8018,7 @@ private:
             }
             drain_ms_ = 0;
             rec_batches_ = 0;
+            rec_wakes_ = 0;
         }
         std::string skipped;
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
@@ -8010,10 +8028,11 @@ private:
         splits_ = 0;
         {
             uint64_t slow = 0, outside = 0;
-            size_t pools = 0;
-            TakeGuestRangeStats(&slow, &outside, &pools);
+            size_t pools = 0, blocks = 0;
+            TakeGuestRangeStats(&slow, &outside, &pools, &blocks);
             LOGI(kTag, "game memory checks (last 10 s): %llu not answered by the per-thread cache, %llu of them outside "
-                 "every memory pool (%zu pools)", (unsigned long long)slow, (unsigned long long)outside, pools);
+                 "every memory pool (%zu pools in %zu contiguous blocks)", (unsigned long long)slow,
+                 (unsigned long long)outside, pools, blocks);
         }
         if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
