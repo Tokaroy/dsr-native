@@ -68,7 +68,7 @@ jobs:
           echo "DSR-LINES-END"
           # Machine code of the command loop (hot spots that the source lines do not explain).
           OBJDUMP=$BIN/llvm-objdump
-          R=$($BIN/llvm-nm -C -S --defined-only "$LIB" | grep ' VulkanBackend::ExecuteCommands(' | head -1)
+          R=$($BIN/llvm-nm -C -S --defined-only "$LIB" | grep -F ' dsr::hle::nvn::(anonymous namespace)::VulkanBackend::ExecuteCommands(' | head -1)
           if [ -n "$R" ]; then
             S=$((16#$(echo $R | cut -d' ' -f1))); N=$((16#$(echo $R | cut -d' ' -f2)))
             echo "DSR-DISASM-BEGIN"
