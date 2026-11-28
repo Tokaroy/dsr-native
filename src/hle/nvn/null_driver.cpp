@@ -796,7 +796,7 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
         for (int i = 0; i < GuestRangeCache::kEntries; i++) cache->lo[i] = cache->hi[i] = 0;
         cache->version = cached_version;
     }
-    const unsigned slot = cache->next++ % GuestRangeCache::kEntries;
+    const unsigned slot = GuestRangeCache::Slot(lo);
     cache->lo[slot] = p.lo;
     cache->hi[slot] = p.hi;
     return true;

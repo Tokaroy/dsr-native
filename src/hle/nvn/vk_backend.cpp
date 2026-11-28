@@ -4235,24 +4235,29 @@ private:
         rec_batch_->ops++;
         return p + kHeadBytes;
     }
-    // Hands the batch being filled to the recorder.
-    void Publish() {
-        if (!rec_batch_) return;
-        if (!rec_batch_->ops) return;
-        rec_queued_.fetch_add(1, std::memory_order_release);  // before the push: Drain() never sees it idle early
-        while (!rec_queue_.Push(rec_batch_)) CpuRelax();     // 1024 batches behind: wait for the recorder
-        rec_batch_ = nullptr;
-        rec_batches_++;
+    // Hands the batch being filled to the recorder. A sleeping recorder is woken only once two batches wait
+    // (`eager`: Drain and full batches wake it at once): waking it cost a system call for ~90% of all batches
+    // (~16,000 per 10 s on the AYN Thor), the render thread's main one.
+    void Publish(bool eager = true) {
+        if (rec_batch_ && rec_batch_->ops) {
+            rec_queued_.fetch_add(1, std::memory_order_release);  // before the push: Drain() never sees it idle early
+            while (!rec_queue_.Push(rec_batch_)) CpuRelax();     // 1024 batches behind: wait for the recorder
+            rec_batch_ = nullptr;
+            rec_batches_++;
+        }
+        // Also with nothing new: a batch published lazily before may still wait for a sleeping recorder.
+        if (rec_queued_.load(std::memory_order_relaxed) == 0) return;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (rec_sleeping_.load(std::memory_order_seq_cst)) {
+        if (rec_sleeping_.load(std::memory_order_seq_cst) &&
+            (eager || rec_queued_.load(std::memory_order_relaxed) >= 2)) {
             rec_wakes_++;
             std::lock_guard<std::mutex> lk(rec_mutex_);
             rec_cv_.notify_one();
         }
     }
-    // Publishes small batches so the recorder starts early (about 32 draws' worth).
+    // Publishes small batches so the recorder starts early (about 50 draws' worth).
     void MaybePublish() {
-        if (rec_batch_ && (rec_batch_->used >= (24u << 10) || rec_batch_->ops >= 96)) Publish();
+        if (rec_batch_ && (rec_batch_->used >= (40u << 10) || rec_batch_->ops >= 160)) Publish(false);
     }
     // Waits until everything queued is recorded (render thread).
     void Drain() {

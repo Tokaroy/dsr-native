@@ -188,13 +188,15 @@ TexRef WindowTexture(const void* nvn_window, int index);
 // (8% of the render thread as a call): inline, a repeat inside the pool found last on this thread is answered
 // without a call; the rest goes to GuestRangeValidSlow (null_driver.cpp), which refills that cache.
 extern std::atomic<uint64_t> g_pool_ranges_version;
-// The last 8 pools found on this thread: a draw checks vertex, index, uniform and texture memory, which live in
-// different pools (one entry missed nearly every time).
+// The pools found on this thread, by address: a direct-mapped table keyed by the address's 16 KB block (the
+// game registers ~5,000-6,000 separate pools, not adjacent to one another; an 8-entry list missed ~2.5 million
+// times per 10 s). An entry holds the whole pool, so any range inside it hits.
 struct GuestRangeCache {
-    static constexpr int kEntries = 8;
+    static constexpr int kEntries = 512;
+    static constexpr unsigned kShift = 14;
+    static unsigned Slot(uintptr_t a) { return unsigned((a >> kShift) ^ (a >> (kShift + 9))) & (kEntries - 1); }
     uintptr_t lo[kEntries] = {}, hi[kEntries] = {};
     uint64_t version = 0;
-    unsigned next = 0;
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
 // Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered.
@@ -202,9 +204,10 @@ void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_
 inline bool GuestRangeValid(uint64_t addr, size_t size) {
     static thread_local GuestRangeCache cache;
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
-    if (hi >= lo && cache.version == g_pool_ranges_version.load(std::memory_order_acquire))
-        for (int i = 0; i < GuestRangeCache::kEntries; i++)
-            if (lo >= cache.lo[i] && hi <= cache.hi[i]) return true;
+    if (hi >= lo && cache.version == g_pool_ranges_version.load(std::memory_order_acquire)) {
+        const unsigned i = GuestRangeCache::Slot(lo);
+        if (lo >= cache.lo[i] && hi <= cache.hi[i]) return true;
+    }
     return GuestRangeValidSlow(addr, size, &cache);
 }
 // Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:
