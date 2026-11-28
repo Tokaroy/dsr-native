@@ -2033,7 +2033,9 @@ private:
     // within one refresh (the first is dropped) and the next refresh repeats a frame: a stutter. Here each frame
     // (its whole submission, the GPU work and the copy to the screen) is held back until it will finish half a
     // refresh before the refresh it is meant for: one frame per refresh (or per 2 at 30 fps), always at the same
-    // point between two refreshes, never queued (FIFO's queue of finished frames was its added latency).
+    // point between two refreshes, never queued (FIFO's queue of finished frames was its added latency). How early
+    // each frame was for its slot goes to the frame limiter (ReportPresentSlack), which starts the game's frames
+    // later until they arrive just before it: holding frames for most of a refresh added that much input latency.
     bool mailbox_ = false;
     int64_t mailbox_target_ = 0;  // the refresh the previous frame was meant for (steady_clock ns)
     double gpu_est_ms_ = 0;       // GPU time of a frame's submission: rises at once, falls slowly
@@ -2053,10 +2055,20 @@ private:
         const int64_t spacing = std::max<int64_t>(1, std::llround(1e9 / fps / double(vp)));
         auto on_grid = [&](int64_t t) { return vs + (t > vs ? (t - vs + vp - 1) / vp : 0) * vp; };  // next refresh
         // Started now, the GPU work is done at now + gpu: the first refresh at least half a period after that.
-        int64_t target = on_grid(now + gpu + vp / 2);
-        if (mailbox_target_ && target < mailbox_target_ + spacing * vp - vp / 2)
-            target = on_grid(mailbox_target_ + spacing * vp - vp / 2);
-        if (mailbox_target_ && now + gpu > mailbox_target_ - vp / 4) hold_late_++;  // the previous one ran late
+        const int64_t earliest = on_grid(now + gpu + vp / 2);
+        int64_t target = earliest;
+        if (mailbox_target_ && mailbox_target_ + 8 * vp < earliest) mailbox_target_ = 0;  // after a pause: start over
+        if (mailbox_target_) {
+            // This frame's slot: `spacing` refreshes after the previous one. Ready before it: wait for it (the frame
+            // limiter then starts the game's frames later); after it: the next possible refresh (late).
+            const int64_t slot = on_grid(mailbox_target_ + spacing * vp - vp / 2);
+            dsr::ReportPresentSlack(double(slot - vp / 2 - gpu - now) / 1e6);
+            if (slot >= earliest) {
+                target = slot;
+            } else {
+                hold_late_++;
+            }
+        }
         int64_t start = target - vp / 2 - gpu;
         if (start - now > 3 * vp) start = now + 3 * vp;  // bounded, whatever the estimates say
         if (start > now) {

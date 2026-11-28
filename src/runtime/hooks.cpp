@@ -684,6 +684,16 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
     if (last.time_since_epoch().count() != 0) {
         deadline += period;
+        // present_mode mailbox pacing: frames ready long before their slot waited for it there (a refresh of added
+        // latency, input read that much earlier); late ones slip a refresh. The deadline moves (at most 0.5 ms a
+        // frame) until frames are ready about 1.5 ms before their slot.
+        {
+            const int64_t t = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (t - g_present_slack_at.load(std::memory_order_relaxed) < 500'000'000) {
+                const double adjust = std::clamp((g_present_slack_ms.load(std::memory_order_relaxed) - 1.5) * 0.15, -0.5, 0.5);
+                deadline += std::chrono::nanoseconds(int64_t(adjust * 1e6));
+            }
+        }
         // More than half a period behind (a hitch, a loading stall, a lower rate than before, the game held by the
         // menu): the schedule starts again from now instead of rushing frames out to catch up.
         if (now > deadline + period / 2) deadline = now;
@@ -824,6 +834,15 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+std::atomic<float> g_present_slack_ms{0.0f};
+std::atomic<int64_t> g_present_slack_at{0};  // steady_clock ns of the last report
+void ReportPresentSlack(double ms) {
+    const float prev = g_present_slack_ms.load(std::memory_order_relaxed);
+    const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const bool fresh = now - g_present_slack_at.load(std::memory_order_relaxed) < 500'000'000;
+    g_present_slack_ms.store(fresh ? prev + 0.2f * (float(ms) - prev) : float(ms), std::memory_order_relaxed);
+    g_present_slack_at.store(now, std::memory_order_relaxed);
+}
 void ReportGpuFrameTime(double ms) {
     if (!(ms > 0.0)) return;
     const float prev = g_gpu_frame_ms.load(std::memory_order_relaxed);
