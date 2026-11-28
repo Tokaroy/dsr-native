@@ -197,6 +197,8 @@ struct GuestRangeCache {
     unsigned next = 0;
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
+// Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered.
+void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools);
 inline bool GuestRangeValid(uint64_t addr, size_t size) {
     static thread_local GuestRangeCache cache;
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);

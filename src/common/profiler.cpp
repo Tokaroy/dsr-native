@@ -154,8 +154,8 @@ void Report() {
     if (samples.empty()) return;
     const int n = g_nslots.load();
     for (int slot = 0; slot < n; slot++) {
-        std::map<std::string, int> self, ours, game, libs;
-        int total = 0;
+        std::map<std::string, int> self, ours, game, libs, sys;
+        int total = 0, sys_total = 0;
         for (const Sample& s : samples) {
             if (s.slot != slot) continue;
             total++;
@@ -167,6 +167,18 @@ void Report() {
                 libs[w.kind == 0 ? "game" : w.kind == 1 ? "ours" : plus != std::string::npos ? w.label.substr(0, plus) : "?"]++;
             }
             self[w.kind == 1 || w.kind == 0 ? Locate(s.pc[0] & ~uintptr_t(63)).label : w.label]++;
+            // Samples in a system call: which of our functions (or the game's) made it.
+            if (w.label.find("syscall") != std::string::npos || w.label.find("ioctl") != std::string::npos ||
+                w.label.find("futex") != std::string::npos || w.label.find("sched_yield") != std::string::npos) {
+                sys_total++;
+                for (int d = 1; d < s.depth; d++) {
+                    const Where x = Locate(s.pc[d] - 4);
+                    if (x.kind == 0 || x.kind == 1) {
+                        sys[Locate((s.pc[d] - 4) & ~uintptr_t(63)).label]++;
+                        break;
+                    }
+                }
+            }
             bool got_ours = false, got_game = false;
             for (int d = 0; d < s.depth && (!got_ours || !got_game); d++) {
                 const uintptr_t a = d == 0 ? s.pc[0] : s.pc[d] - 4;  // return address -> the call
@@ -233,6 +245,7 @@ void Report() {
         top("self", self);
         top("in our code", ours);
         top("in game code", game);
+        if (sys_total >= 10) top("system calls made from", sys);
     }
 }
 

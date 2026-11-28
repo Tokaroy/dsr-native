@@ -744,7 +744,15 @@ void CheckWatchedTextures() {
     }
 }
 
+std::atomic<uint64_t> g_range_slow{0}, g_range_outside{0};
+void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools) {
+    *slow = g_range_slow.exchange(0, std::memory_order_relaxed);
+    *outside = g_range_outside.exchange(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+    *pools = g_pool_ranges.size();
+}
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
+    g_range_slow.fetch_add(1, std::memory_order_relaxed);
     // Called many times per draw (~5% of the render thread with a 4-entry cache and a lock on misses): each
     // thread keeps a copy of the sorted pool list, refreshed only when pools change, and searches it lock-free.
     // The inline fast path (backend.h) answers repeats inside the pool found last without a call; this fills it.
@@ -769,9 +777,11 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
         if (ranges[m].lo <= lo) l = m + 1;
         else r = m;
     }
-    if (l == 0) return false;
+    if (l == 0 || hi > ranges[l - 1].hi) {
+        g_range_outside.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const Range& p = ranges[l - 1];
-    if (hi > p.hi) return false;
     if (cache->version != cached_version) {  // pools changed: forget the old entries
         for (int i = 0; i < GuestRangeCache::kEntries; i++) cache->lo[i] = cache->hi[i] = 0;
         cache->version = cached_version;

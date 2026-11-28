@@ -8008,6 +8008,13 @@ private:
              (unsigned long long)drawn_, pipelines_.size(), shaders_translated_, uploads_, flushes_,
              (unsigned long long)splits_, skipped.c_str());
         splits_ = 0;
+        {
+            uint64_t slow = 0, outside = 0;
+            size_t pools = 0;
+            TakeGuestRangeStats(&slow, &outside, &pools);
+            LOGI(kTag, "game memory checks (last 10 s): %llu not answered by the per-thread cache, %llu of them outside "
+                 "every memory pool (%zu pools)", (unsigned long long)slow, (unsigned long long)outside, pools);
+        }
         if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
                  (unsigned long long)bc_converted_levels_, bc_convert_ms_, (unsigned long long)bc_cache_hits_,
