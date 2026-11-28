@@ -427,38 +427,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private float mSwipeDirX, mSwipeDirY;  // the last swipe direction (unit), for a held thumb
     private static final float SWIPE_HOLD_TILT = 1e-3f;  // clear of the pad value rounding (1/32767)
     private long mSwipeLastNs;
-    // Diagnostics (swipe camera judder on a Thor): per swipe, the display frames the speed was measured over, how
-    // many of them got no touch movement (the speed dips there: judder), the touch moves, and frame spacing.
-    private int mSwStatFrames, mSwStatEmpty, mSwStatMoves, mSwStatLogs;
-    private float mSwStatDtSum, mSwStatDtMax, mSwStatDtMin = 1f;
-    private long mSwStatStartMs;
-
-    private void swipeStatEnd() {
-        if (mSwStatFrames >= 20 && mSwStatLogs < 40) {
-            mSwStatLogs++;
-            touchLog(String.format(java.util.Locale.ROOT,
-                    "swipe camera: %.2f s, %d display frames (%.1f ms apart on average, %.1f to %.1f), %d without "
-                            + "touch movement, %d touch moves",
-                    (android.os.SystemClock.uptimeMillis() - mSwStatStartMs) / 1000f, mSwStatFrames,
-                    1000f * mSwStatDtSum / mSwStatFrames, 1000f * mSwStatDtMin, 1000f * mSwStatDtMax, mSwStatEmpty,
-                    mSwStatMoves));
-        }
-        mSwStatFrames = mSwStatEmpty = mSwStatMoves = 0;
-        mSwStatDtSum = mSwStatDtMax = 0;
-        mSwStatDtMin = 1f;
-        mSwStatStartMs = android.os.SystemClock.uptimeMillis();
-    }
     private final android.view.Choreographer.FrameCallback mSwipeFrame = new android.view.Choreographer.FrameCallback() {
         @Override
         public void doFrame(long frameNs) {
             float dt = mSwipeLastNs == 0 ? 0.016f : Math.max(0.004f, Math.min(0.05f, (frameNs - mSwipeLastNs) / 1e9f));
-            if (mSwipeLastNs != 0 && mRStickPointer >= 0) {
-                mSwStatFrames++;
-                if (mSwipeAccX == 0 && mSwipeAccY == 0) mSwStatEmpty++;
-                mSwStatDtSum += dt;
-                mSwStatDtMax = Math.max(mSwStatDtMax, dt);
-                mSwStatDtMin = Math.min(mSwStatDtMin, dt);
-            }
             mSwipeLastNs = frameNs;
             float k = 1f - (float) Math.exp(-dt / SWIPE_SMOOTH_S);
             mSwipeVelX += (mSwipeAccX / dt - mSwipeVelX) * k;
@@ -1229,7 +1201,6 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 break;
             case K_RSTICK: {
                 if (sSwipe) {
-                    if (x != mRX || y != mRY) mSwStatMoves++;
                     mSwipeAccX += x - mRX;
                     mSwipeAccY += y - mRY;
                     mRX = x;
@@ -1257,10 +1228,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (id < 0 || id >= 16) return;
         if (mKind[id] == K_BUTTON && mOn[id] != null) mOn[id].pressCount--;
         if (mKind[id] == K_STICK) mStickPointer = -1;
-        if (mKind[id] == K_RSTICK) {
-            mRStickPointer = -1;
-            if (sSwipe) swipeStatEnd();
-        }
+        if (mKind[id] == K_RSTICK) mRStickPointer = -1;
         mKind[id] = K_NONE;
         mOn[id] = null;
     }
