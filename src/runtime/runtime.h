@@ -219,6 +219,8 @@ void ReportDisplayRefresh(int64_t last_ns, int64_t period_ns);
 // Diagnostics of the paced frame limiter since the last call (frames on the refresh grid, how many slept and for how
 // long, those that came after their deadline, the phase and the slack it follows), for the 10 s report.
 std::string TakeLimiterReport();
+// The frame limiter is pacing to the display's refreshes (present_mode mailbox pacing reports came lately).
+bool DisplayPacingActive();
 // Whether the GPU samples BC textures itself (natively or through BCeNabler): 1 yes, 0 no (converted on the CPU),
 // -1 not known yet (no Vulkan device). The menu turns texture_mip_skip on with performance mode only without BC.
 void SetGpuHasBc(bool has);

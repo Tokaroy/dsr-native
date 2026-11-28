@@ -613,7 +613,12 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         LOGI(kTag, "presenting at up to %d fps (settings); nvnQueuePresentTexture called from main+0x%lx", fps,
              (unsigned long)(m.Contains(ra) ? ra - m.base() : 0));
     }
-    if (next > now)
+    // A second pace at the present, on its own 60.000 fps timeline. Not with display pacing (present_mode mailbox):
+    // the frame limiter then starts frames on the screen's refresh grid (59.8 Hz on a Thor), and this one delaying
+    // the frames after a slow one (the catch-up) by its own schedule put them late for their refreshes.
+    if (dsr::DisplayPacingActive())
+        next = now;
+    else if (next > now)
         std::this_thread::sleep_until(next);
     else if (now - next > frame * 4)
         next = now;  // fell behind (loading): resync instead of bursting

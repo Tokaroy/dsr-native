@@ -2063,6 +2063,17 @@ private:
         const int64_t err = done - (vs + k * vp - margin);  // > 0: later than the aim; within half a refresh
         dsr::ReportPresentSlack(-double(err) / 1e6);
         pace_off_us_ += uint64_t(std::llabs(err) / 1000);
+        // Diagnostics: a frame finishing over 6 ms after its aim (8 ms more and it misses its refresh) logs what the
+        // game's threads ran in the 40 ms before (profiler; at most 20 per 10 s).
+        if (err > 6'000'000) {
+            static int64_t window = 0;
+            static int logged = 0;
+            if (now - window > 10'000'000'000) {
+                window = now;
+                logged = 0;
+            }
+            if (logged++ < 20) dsr::profiler::NoteSlowFrame(now - 40'000'000, now, double(err) / 1e6, "frame late for its aim");
+        }
         // Which refresh shows it (the first after it is done): two on one refresh drop one, a gap repeats one.
         const int64_t shown = vs + ((done - vs + vp - 1) / vp) * vp;
         if (mailbox_shown_) {

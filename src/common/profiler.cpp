@@ -240,6 +240,7 @@ void Report() {
 struct SlowFrame {
     int64_t from, to;
     double ms;
+    const char* what;  // a string literal
 };
 std::mutex g_slow_mutex;
 std::vector<SlowFrame> g_slow;
@@ -286,7 +287,7 @@ void ReportSlowFrames() {
             snprintf(b + len, sizeof(b) - len, "]");
             line += b;
         }
-        LOGI(kTag, "slow frame (%.1f ms): %s", f.ms, line.empty() ? "no thread used the CPU much (waiting?)" : line.c_str());
+        LOGI(kTag, "%s (%.1f ms): %s", f.what, f.ms, line.empty() ? "no thread used the CPU much (waiting?)" : line.c_str());
     }
 }
 
@@ -326,10 +327,10 @@ void StartTimer(ThreadSlot& t) {
 
 bool Enabled() { return g_enabled.load(); }
 
-void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms) {
+void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms, const char* what) {
     if (!g_enabled.load()) return;
     std::lock_guard<std::mutex> lk(g_slow_mutex);
-    if (g_slow.size() < 32) g_slow.push_back({from_ns, to_ns, ms});
+    if (g_slow.size() < 32) g_slow.push_back({from_ns, to_ns, ms, what});
 }
 
 void Enable() {

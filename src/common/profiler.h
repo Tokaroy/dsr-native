@@ -15,6 +15,6 @@ bool Enabled();
 void RegisterCurrentThread(const char* name);
 // A frame that took long (frame limiter): what the registered threads ran on the CPU in [from_ns, to_ns]
 // (CLOCK_MONOTONIC) is logged within a second, from the reporter thread (the samples stay in the ring ~10 s).
-void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms);
+void NoteSlowFrame(int64_t from_ns, int64_t to_ns, double ms, const char* what = "slow frame");
 
 }  // namespace dsr::profiler

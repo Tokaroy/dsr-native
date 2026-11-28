@@ -905,6 +905,10 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+bool DisplayPacingActive() {
+    return std::chrono::steady_clock::now().time_since_epoch().count() - g_present_slack_at.load(std::memory_order_relaxed) <
+           500'000'000;
+}
 std::string TakeLimiterReport() {
     const uint64_t grid = g_lim_grid.exchange(0), other = g_lim_other.exchange(0), slept = g_lim_slept.exchange(0),
                    sleep_ns = g_lim_sleep_ns.exchange(0), missed = g_lim_missed.exchange(0),
