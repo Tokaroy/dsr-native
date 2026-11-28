@@ -772,7 +772,7 @@ void TakeGuestRangeStats(uint64_t* slow, uint64_t* outside, size_t* pools, size_
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
     *pools = g_pool_ranges.size();
 }
-// One per thread that checks game memory, kept for the thread's life (a few threads: 64 KB each).
+// One per thread that checks game memory, kept for the thread's life (a few threads: 320 KB each).
 GuestRangeCache* NewGuestRangeCache() { return new GuestRangeCache(); }
 
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
@@ -816,14 +816,12 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
         return false;
     }
     const Range& p = ranges[l - 1];
-    if (cache->version != cached_version) {  // pools changed: forget the old entries
-        for (int i = 0; i < GuestRangeCache::kEntries; i++) cache->lo[i] = cache->hi[i] = 0;
-        cache->version = cached_version;
-    }
     const unsigned slot = GuestRangeCache::Slot(lo);
-    if (cache->hi[slot]) g_range_evicted.fetch_add(1, std::memory_order_relaxed);
+    if (cache->hi[slot] && cache->version[slot] == uint32_t(cached_version))
+        g_range_evicted.fetch_add(1, std::memory_order_relaxed);
     cache->lo[slot] = p.lo;
     cache->hi[slot] = p.hi;
+    cache->version[slot] = uint32_t(cached_version);
     return true;
 }
 

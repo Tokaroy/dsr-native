@@ -188,16 +188,17 @@ TexRef WindowTexture(const void* nvn_window, int index);
 // (8% of the render thread as a call): inline, a repeat inside the pool found last on this thread is answered
 // without a call; the rest goes to GuestRangeValidSlow (null_driver.cpp), which refills that cache.
 extern std::atomic<uint64_t> g_pool_ranges_version;
-// The pools found on this thread, by address: a direct-mapped table keyed by the address's 64 KB block (the
-// game registers ~6,000 separate pools, not adjacent to one another, and a frame reads tens of MB of vertex data
-// spread over them: an 8-entry list, then a 512-entry table of 16 KB blocks, missed 1.5-2.5 million times per
-// 10 s). An entry holds the whole pool, so any range inside it hits. Allocated on a thread's first check (64 KB).
+// The pools found on this thread, by address: a direct-mapped table keyed by the address's 4 KB page. The game
+// registers ~6,000 separate pools, many smaller than 64 KB: with 64 KB keys, pools sharing a block kept
+// replacing each other's entry (~1.1 million misses per 10 s, nearly all of them replacements). Each entry holds
+// its whole pool and the pool-list version it was found under (a destroyed pool invalidates every entry at once
+// without clearing the table). Allocated on a thread's first check (320 KB).
 struct GuestRangeCache {
-    static constexpr int kEntries = 4096;
-    static constexpr unsigned kShift = 16;
-    static unsigned Slot(uintptr_t a) { return unsigned((a >> kShift) ^ (a >> (kShift + 12))) & (kEntries - 1); }
+    static constexpr int kEntries = 16384;
+    static constexpr unsigned kShift = 12;
+    static unsigned Slot(uintptr_t a) { return unsigned((a >> kShift) ^ (a >> (kShift + 14))) & (kEntries - 1); }
     uintptr_t lo[kEntries] = {}, hi[kEntries] = {};
-    uint64_t version = 0;
+    uint32_t version[kEntries] = {};
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
 // Diagnostics since the last call: slow-path lookups, how many were outside every pool, pools registered,
@@ -209,9 +210,11 @@ inline bool GuestRangeValid(uint64_t addr, size_t size) {
     static thread_local GuestRangeCache* cache = nullptr;
     if (__builtin_expect(!cache, 0)) cache = NewGuestRangeCache();
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
-    if (hi >= lo && cache->version == g_pool_ranges_version.load(std::memory_order_acquire)) {
+    if (hi >= lo) {
         const unsigned i = GuestRangeCache::Slot(lo);
-        if (lo >= cache->lo[i] && hi <= cache->hi[i]) return true;
+        if (lo >= cache->lo[i] && hi <= cache->hi[i] &&
+            cache->version[i] == uint32_t(g_pool_ranges_version.load(std::memory_order_acquire)))
+            return true;
     }
     return GuestRangeValidSlow(addr, size, cache);
 }

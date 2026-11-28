@@ -708,13 +708,34 @@ public:
         // The commands were written by the game's recording threads: their memory is in other cores' caches,
         // and most commands (binds) do little else than read it (a profile put ~10% of the render thread on the
         // first loads of bind commands). The commands a few ahead are fetched while this one runs.
-        constexpr size_t kAhead = 4;
+        // Payloads too large to be inline (vertex buffer lists of more than 6 ranges, texture lists, called
+        // lists) are a std::vector on the heap: two more dependent loads, also cold (the disassembly put the hot
+        // spot of the bind commands on loading that vector). Fetched in stages: the command 6 ahead, the vector
+        // of the one 3 ahead (its command is in cache by then), the vector's items of the next one.
+        constexpr size_t kAhead = 6, kAheadObj = 3;
+        auto vector_payload = [](CmdType t) {
+            switch (t) {
+                case CmdType::CallList: case CmdType::UpdateUniform: case CmdType::BindVertexAttribs:
+                case CmdType::BindVertexStreams: case CmdType::BindVertexBuffers: case CmdType::BindUniformBuffers:
+                case CmdType::BindTextures: case CmdType::BindImages:
+                    return true;
+                default:
+                    return false;
+            }
+        };
         const Cmd* const base = cmds.data();
         const size_t count = cmds.size();
         for (size_t ci = 0; ci < count; ci++) {
             if (ci + kAhead < count) {
                 const char* ahead = reinterpret_cast<const char*>(base + ci + kAhead);
                 for (size_t b = 0; b < sizeof(Cmd); b += 64) __builtin_prefetch(ahead + b);
+            }
+            if (ci + kAheadObj < count && base[ci + kAheadObj].obj && vector_payload(base[ci + kAheadObj].type))
+                __builtin_prefetch(base[ci + kAheadObj].obj.get());
+            if (ci + 1 < count && base[ci + 1].obj && vector_payload(base[ci + 1].type)) {
+                const char* items = *static_cast<const char* const*>(base[ci + 1].obj.get());  // vector::data()
+                if (items)
+                    for (size_t b = 0; b < 256; b += 64) __builtin_prefetch(items + b);
             }
             const Cmd& c = base[ci];
             switch (c.type) {
