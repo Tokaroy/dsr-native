@@ -600,6 +600,7 @@ std::atomic<float> g_present_slack_ms{0.0f};  // ReportPresentSlack: smoothed, m
 constexpr double kPacingSlackMs = 1.5;
 std::atomic<int64_t> g_present_slack_at{0};   // steady_clock ns of the last report
 std::atomic<int64_t> g_refresh_last{0}, g_refresh_period{0};  // ReportDisplayRefresh
+std::atomic<int64_t> g_limiter_paced_at{0};  // steady_clock ns of the last frame the limiter paced (LimiterPacedRecently)
 std::atomic<uint64_t> g_lim_grid{0}, g_lim_other{0}, g_lim_slept{0}, g_lim_sleep_ns{0}, g_lim_missed{0},
     g_lim_resync{0};
 std::atomic<int64_t> g_lim_phase_us{0}, g_lim_slack_sum_us{0}, g_lim_miss_sum_us{0};
@@ -742,6 +743,7 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
             grid = next;
             deadline = clock::time_point(std::chrono::nanoseconds(next + int64_t(phase_ms * 1e6)));
             g_lim_grid.fetch_add(1, std::memory_order_relaxed);
+            g_limiter_paced_at.store(tn, std::memory_order_relaxed);
             g_lim_phase_us.store(int64_t(phase_ms * 1000), std::memory_order_relaxed);
             g_lim_slack_sum_us.fetch_add(int64_t(g_present_slack_ms.load(std::memory_order_relaxed) * 1000),
                                          std::memory_order_relaxed);
@@ -906,6 +908,10 @@ struct Hook {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+bool LimiterPacedRecently() {
+    return std::chrono::steady_clock::now().time_since_epoch().count() - g_limiter_paced_at.load(std::memory_order_relaxed) <
+           100'000'000;
+}
 bool DisplayPacingActive() {
     return std::chrono::steady_clock::now().time_since_epoch().count() - g_present_slack_at.load(std::memory_order_relaxed) <
            500'000'000;

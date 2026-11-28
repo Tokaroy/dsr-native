@@ -47,6 +47,9 @@ struct RuntimeConfig {
     // mailbox_pacing: with present_mode mailbox, each frame is held back to finish half a refresh before the refresh
     // it is meant for (vk_backend.cpp, MailboxHold): no dropped or repeated frames, still no queue. 0 = plain mailbox.
     bool mailbox_pacing = true;
+    // split_submit: a frame's command list goes to the GPU in up to three parts, at render pass ends, so the GPU starts
+    // drawing while the rest is still being translated (vk_backend.cpp, MaybeSplitSubmit); 0 = one submission.
+    bool split_submit = true;
     // mailbox_margin: how long before its refresh a paced frame is finished, in ms (0 = half a refresh). The
     // compositor takes the newest frame for a refresh some time before it: frames should finish in the middle
     // between two such moments. 10 was the best of 4 / 8 / 10 / 12 / 14 on a Thor at 60 Hz (4 and 14 stuttered).
@@ -222,6 +225,9 @@ void ReportDisplayRefresh(int64_t last_ns, int64_t period_ns);
 std::string TakeLimiterReport();
 // The frame limiter is pacing to the display's refreshes (present_mode mailbox pacing reports came lately).
 bool DisplayPacingActive();
+// The frame limiter paced the last frame itself (it is skipped while the game turns it off: loading screens, some
+// menus); then the present-side pace stands down.
+bool LimiterPacedRecently();
 // Whether the GPU samples BC textures itself (natively or through BCeNabler): 1 yes, 0 no (converted on the CPU),
 // -1 not known yet (no Vulkan device). The menu turns texture_mip_skip on with performance mode only without BC.
 void SetGpuHasBc(bool has);

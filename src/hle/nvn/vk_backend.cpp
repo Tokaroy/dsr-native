@@ -991,6 +991,8 @@ public:
         geo_lo_ = UINTPTR_MAX;
         geo_hi_ = 0;
         StartPrehash();
+        split_from_draw_ = drawn_;
+        splits_in_list_ = 0;
         ProfListStart();
         prof_frame_start_ = false;
         ExecuteCommands(cmds, 0);
@@ -1001,6 +1003,7 @@ public:
             FlushLateDepth();
             FlushEarlyClears();
             ProfListEnd();
+            slots_[slot_].partial = false;
             SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
             recording_ = false;
         }
@@ -1626,6 +1629,7 @@ public:
         ProfPresentEnd();
         prof_frame_start_ = true;
         Slot& sl = slots_[slot_];
+        sl.partial = false;
         sl.ts_written = sl.ts != VK_NULL_HANDLE;
         sl.pending = true;
         sl.submits_queued++;
@@ -2677,6 +2681,7 @@ private:
     // Submit what is recorded so far and start over (streaming buffer / descriptors exhausted).
     void Flush() {
         if (!recording_) return;
+        slots_[slot_].partial = true;  // the list goes on in the next submission
         EndRendering();
         SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
         CollectOcclusion(slots_[slot_]);  // done on the GPU; the same slot's queries are reset by Begin
@@ -4319,6 +4324,37 @@ private:
     struct Slot;
     // GPU time of a finished submission (its fence has signalled), added to the 10 s statistics.
     double gpu_busy_ms_ = 0;
+    double gpu_partial_ms_ = 0;  // GPU time of a list's earlier parts, not yet counted
+    // ---- split submissions (settings.txt split_submit) ----
+    // A list used to reach the GPU as one submission at its end: the GPU started a frame only once the render thread
+    // and the recorder had gone through all of it (~10 ms on a Thor), then drew it (~12 ms). Now, where a render
+    // pass ends anyway (no extra tile store / load) and at least kSplitDraws draws have been recorded since the last
+    // submission, what is recorded goes to the GPU and recording goes on in the next slot: the GPU draws the first
+    // passes while the rest is still being translated (less latency, steadier finish times). Not when the next
+    // slot's previous work has not finished (that wait would stall the render thread), not in profiled or captured
+    // frames, at most kMaxSplits per list.
+    static constexpr uint64_t kSplitDraws = 300;
+    static constexpr int kMaxSplits = 2;
+    uint64_t split_from_draw_ = 0;
+    int splits_in_list_ = 0;
+    uint64_t splits_ = 0;
+    void MaybeSplitSubmit() {
+        if (!recording_ || !dsr::GetRuntime().config.split_submit || splits_in_list_ >= kMaxSplits ||
+            prof_state_ == kProfRecording || capture_active_ || drawn_ - split_from_draw_ < kSplitDraws)
+            return;
+        Slot& next = slots_[(slot_ + 1) % kSlots];
+        if (next.pending && (next.submits_done.load(std::memory_order_acquire) != next.submits_queued ||
+                             vkGetFenceStatus(device_, next.fence) != VK_SUCCESS))
+            return;
+        split_from_draw_ = drawn_;
+        splits_in_list_++;
+        splits_++;
+        slots_[slot_].partial = true;
+        SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CollectOcclusion(slots_[slot_]);  // as Flush: the new slot's earlier queries (done on the GPU)
+        recording_ = false;
+        Begin();
+    }
     void CollectGpuTime(Slot& sl) {
         if (!sl.ts || !sl.ts_written) return;
         sl.ts_written = false;
@@ -4326,8 +4362,17 @@ private:
         if (vkGetQueryPoolResults(device_, sl.ts, 0, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
             const double ms = double(t[1] - t[0]) * props_.limits.timestampPeriod / 1e6;
             gpu_busy_ms_ += ms;
+            // A list split into several submissions (split_submit): its parts' time goes with its last part, so a
+            // list still counts whole (fps = auto); mailbox pacing estimates from the last part alone (the earlier
+            // ones are done or nearly by the time the frame is presented).
+            if (sl.partial) {
+                gpu_partial_ms_ += ms;
+                return;
+            }
             gpu_est_ms_ += (ms > gpu_est_ms_ ? 0.5 : 0.05) * (ms - gpu_est_ms_);
-            dsr::ReportGpuFrameTime(ms);  // fps = auto weighs it against the frame period
+            const double whole = ms + gpu_partial_ms_;
+            gpu_partial_ms_ = 0;
+            dsr::ReportGpuFrameTime(whole);  // fps = auto weighs it against the frame period
         }
     }
 
@@ -5243,6 +5288,7 @@ private:
         if (!rendering_ && key == ended_key_ && ended_line_) resumed_passes_[ended_line_]++;
         EndRendering();
         ended_line_ = 0;
+        MaybeSplitSubmit();
         // Work done between passes (and the copies / clears recorded since the last pass started) is its own
         // interval when there is any, not part of the previous pass's time.
         if (!late_depth_q_.empty() || !early_clears_.empty()) ProfStamp("between passes");
@@ -7925,8 +7971,9 @@ private:
         }
         std::string skipped;
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
-        LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
-             pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
+        LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes, %llu split submissions%s",
+             (unsigned long long)drawn_, pipelines_.size(), shaders_translated_, uploads_, flushes_,
+             (unsigned long long)splits_, skipped.c_str());
         if (bc_converted_levels_ || bc_cache_hits_ || bc_disk_hits_) {
             LOGI(kTag, "BC textures converted on the CPU: %llu levels in %.0f ms, %llu from the memory cache (%.0f MB)",
                  (unsigned long long)bc_converted_levels_, bc_convert_ms_, (unsigned long long)bc_cache_hits_,
@@ -9220,6 +9267,7 @@ private:
         std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)
         std::vector<VkFramebuffer> framebuffers;    // render pass fallback: destroyed when the slot is reused
         uint64_t submits_queued = 0;                // render thread
+        bool partial = false;                       // a list's earlier part (split_submit): GPU time counted with the rest
         uint64_t seq = 0;                           // submit_seq_ of its last submission
         std::atomic<uint64_t> submits_done{0};      // recorder, after vkQueueSubmit
         size_t extra_used = 0;

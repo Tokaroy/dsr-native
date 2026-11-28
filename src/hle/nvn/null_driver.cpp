@@ -613,10 +613,12 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         LOGI(kTag, "presenting at up to %d fps (settings); nvnQueuePresentTexture called from main+0x%lx", fps,
              (unsigned long)(m.Contains(ra) ? ra - m.base() : 0));
     }
-    // A second pace at the present, on its own 60.000 fps timeline. Not with display pacing (present_mode mailbox):
-    // the frame limiter then starts frames on the screen's refresh grid (59.8 Hz on a Thor), and this one delaying
-    // the frames after a slow one (the catch-up) by its own schedule put them late for their refreshes.
-    if (dsr::DisplayPacingActive())
+    // A second pace at the present, on its own 60.000 fps timeline. Not while the frame limiter paces to the display
+    // (present_mode mailbox): it then starts frames on the screen's refresh grid (59.8 Hz on a Thor), and this one
+    // delaying the frames after a slow one (the catch-up) by its own schedule put them late for their refreshes.
+    // Where the game turns its limiter off (loading screens, some menus) this one caps the frames again (they ran
+    // uncapped: ~100 fps on a Thor, frames the screen never showed).
+    if (dsr::LimiterPacedRecently())
         next = now;
     else if (next > now)
         std::this_thread::sleep_until(next);
