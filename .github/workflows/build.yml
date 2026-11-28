@@ -54,6 +54,19 @@ jobs:
           $NM -n -C --defined-only "$LIB" | grep -iE ' [tw] ' | sed 's/^0*//'
           echo "DSR-SYMBOLS-END"
 
+      # Source lines of the render path's hot functions by profiler bucket (64 bytes), for reading profiles.
+      - name: Hot function lines
+        continue-on-error: true
+        run: |
+          BIN=$(dirname $(ls $ANDROID_HOME/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm | head -1))
+          LIB=$(ls android/app/build/intermediates/cxx/*/*/obj/arm64-v8a/libdsr.so | head -1)
+          echo "DSR-LINES-BEGIN"
+          python3 tools/ci_lines.py $BIN/llvm-nm $BIN/llvm-symbolizer "$LIB" \
+            "VulkanBackend::ExecuteCommands" "VulkanBackend::Draw(" "VulkanBackend::GeoCached" \
+            "VulkanBackend::GeoHash" "VulkanBackend::IndexRange" "VulkanBackend::UploadCached" \
+            "VulkanBackend::SampledView" "VulkanBackend::View(" "VulkanBackend::FindImage" "GuestRangeValidSlow"
+          echo "DSR-LINES-END"
+
       # Unstripped native library: symbolizes the profiler's dsr+0x... addresses.
       - uses: actions/upload-artifact@v4
         with:
