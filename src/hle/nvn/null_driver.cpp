@@ -772,9 +772,13 @@ bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache) {
     if (l == 0) return false;
     const Range& p = ranges[l - 1];
     if (hi > p.hi) return false;
-    cache->lo = p.lo;
-    cache->hi = p.hi;
-    cache->version = cached_version;
+    if (cache->version != cached_version) {  // pools changed: forget the old entries
+        for (int i = 0; i < GuestRangeCache::kEntries; i++) cache->lo[i] = cache->hi[i] = 0;
+        cache->version = cached_version;
+    }
+    const unsigned slot = cache->next++ % GuestRangeCache::kEntries;
+    cache->lo[slot] = p.lo;
+    cache->hi[slot] = p.hi;
     return true;
 }
 

@@ -188,17 +188,21 @@ TexRef WindowTexture(const void* nvn_window, int index);
 // (8% of the render thread as a call): inline, a repeat inside the pool found last on this thread is answered
 // without a call; the rest goes to GuestRangeValidSlow (null_driver.cpp), which refills that cache.
 extern std::atomic<uint64_t> g_pool_ranges_version;
+// The last 8 pools found on this thread: a draw checks vertex, index, uniform and texture memory, which live in
+// different pools (one entry missed nearly every time).
 struct GuestRangeCache {
-    uintptr_t lo = 1, hi = 0;
+    static constexpr int kEntries = 8;
+    uintptr_t lo[kEntries] = {}, hi[kEntries] = {};
     uint64_t version = 0;
+    unsigned next = 0;
 };
 bool GuestRangeValidSlow(uint64_t addr, size_t size, GuestRangeCache* cache);
 inline bool GuestRangeValid(uint64_t addr, size_t size) {
     static thread_local GuestRangeCache cache;
     const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
-    if (lo >= cache.lo && hi <= cache.hi && hi >= lo &&
-        cache.version == g_pool_ranges_version.load(std::memory_order_acquire))
-        return true;
+    if (hi >= lo && cache.version == g_pool_ranges_version.load(std::memory_order_acquire))
+        for (int i = 0; i < GuestRangeCache::kEntries; i++)
+            if (lo >= cache.lo[i] && hi <= cache.hi[i]) return true;
     return GuestRangeValidSlow(addr, size, &cache);
 }
 // Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:

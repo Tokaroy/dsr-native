@@ -842,9 +842,7 @@ public:
                 case CmdType::BindVertexStreams:
                     {
                         const auto v = Items<VertexStreamObj>(c);
-                        if (st_.streams.size() != v.size() ||
-                            (v.size() && memcmp(st_.streams.data(), v.data(), v.size() * sizeof(VertexStreamObj))))
-                            st_.streams.assign(v.begin(), v.end());
+                        st_.streams.assign(v.begin(), v.end());
                     }
                     break;
                 case CmdType::BindVertexBuffers: {
